@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags, except the uptime floor.
@@ -554,16 +555,22 @@ _TABLE = r"%s(?:\s*\.\s*%s){0,2}" % (_NAME, _NAME)
 _TARGET = r"(?P<name>%s)\s+ON\s+(?P<table>%s)" % (_NAME, _TABLE)
 _DROP = re.compile(r"DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?" + _TARGET, re.I)
 _ALTER = re.compile(r"ALTER\s+INDEX\s+" + _TARGET + r"\s+DISABLE\b", re.I)
+# Microsoft makes the CONSTRAINT keyword of ALTER TABLE ... DROP optional, so
+# `DROP uq_x` removes a constraint too. The name may not be the bare word
+# CONSTRAINT, or `DROP CONSTRAINT ;` would read as a drop of a constraint so named.
 _CONSTRAINT = re.compile(
-    r"ALTER\s+TABLE\s+(?P<table>%s)\s+DROP\s+CONSTRAINT\s+"
-    r"(?:IF\s+EXISTS\s+)?(?P<name>%s)" % (_TABLE, _NAME), re.I)
+    r"ALTER\s+TABLE\s+(?P<table>%s)\s+DROP\s+(?:CONSTRAINT\s+)?"
+    r"(?:IF\s+EXISTS\s+)?(?P<name>(?!CONSTRAINT\b)%s)" % (_TABLE, _NAME), re.I)
 _WORDS = re.compile(
     r"\b(DROP\s+INDEX|ALTER\s+INDEX|ALTER\s+TABLE|DROP\s+TABLE|"
     r"CREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?(?:COLUMNSTORE\s+)?"
     r"INDEX)\b", re.I)
 _REWRITE = re.compile(r"\bDROP_EXISTING\s*=\s*ON\b", re.I)
 _DISABLE = re.compile(r"\bDISABLE\b", re.I)
-_DROP_CONSTRAINT = re.compile(r"\bDROP\s+CONSTRAINT\b", re.I)
+# ALTER TABLE ... DROP COLUMN and DROP PERIOD remove no constraint, and neither do
+# the ALTER COLUMN forms DROP ROWGUIDCOL, PERSISTED and MASKED.
+_DROP_CONSTRAINT = re.compile(
+    r"\bDROP\s+(?!COLUMN\b|PERIOD\b|ROWGUIDCOL\b|PERSISTED\b|MASKED\b)\S", re.I)
 _WITH = re.compile(r"\s*WITH\s*\(", re.I)
 # USE at the start of a statement. A script that switches database names objects
 # the export knows nothing about.
@@ -917,13 +924,7 @@ def read_text(path, what):
         return decode(handle.read(), what)
 
 
-def main(argv=None):
-    _quiet_encoding()
-    try:
-        args = _parse(sys.argv[1:] if argv is None else argv)
-    except UsageError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 64
+def _run(args):
     if args.self_test:
         return self_test()
     if args.print_query:
@@ -938,9 +939,6 @@ def main(argv=None):
     except Refused as exc:
         print("REFUSED: %s\nNothing was judged." % exc, file=sys.stderr)
         return 3
-    except OSError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 2
     for line in lines:
         print(line)
     if not units:
@@ -951,16 +949,34 @@ def main(argv=None):
               "--apply to write it." % len(units))
         return code
     source = os.path.basename(args.drops) if args.drops else "the plan"
-    try:
-        # Mode "x" fails when the file exists, so an old script survives.
-        with io.open(args.out, "x", encoding="utf-8", newline="\n") as handle:
-            handle.write(drop_script(units, source))
-    except OSError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 2
+    # Mode "x" fails when the file exists, so an old script survives.
+    with io.open(args.out, "x", encoding="utf-8", newline="\n") as handle:
+        handle.write(drop_script(units, source))
     print("Wrote %d unit(s) to %s. Read it, then run it yourself."
           % (len(units), args.out))
     return code
+
+
+def main(argv=None):
+    _quiet_encoding()
+    try:
+        args = _parse(sys.argv[1:] if argv is None else argv)
+    except UsageError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64
+    # Exit 1 means "the audit found something". A crash must not share it, so
+    # every failure that is not a verdict ends in 2.
+    try:
+        return _run(args)
+    except OSError as exc:
+        # A closed output pipe lands here too. Point stdout at a buffer, or
+        # Python fails again when it flushes stdout at exit and exits 120.
+        sys.stdout = io.StringIO()
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    except Exception:
+        traceback.print_exc()
+        return 2
 
 
 # ------------------------------------------------------------------ self-test
@@ -1269,6 +1285,9 @@ def self_test():
     check(actions(plan(pair, None)) == [(HOLD, "ix_a"), (DROP, "ix_b")],
           "with no uptime the unread keeper is held, the copy still drops")
     solo = build([mk("ix_a")])
+    check(actions(plan(pair, 1)) == [(HOLD, "ix_a"), (DROP, "ix_b")],
+          "under the uptime floor the unread keeper is held, and its exact "
+          "copy still drops  <-- pinned defect")
     check(actions(plan(solo, 14 * 24)) == [(DROP, "ix_a")],
           "an unread index drops at exactly the floor")
     check(actions(plan(solo, 14 * 24 - 1)) == [(HOLD, "ix_a")],
@@ -1476,7 +1495,7 @@ def self_test():
           "<-- pinned defect")
     check(parse_drops("ALTER INDEX [ix_a] ON [gis].[parcels] DISABLE;")[0] ==
           ("gis", "parcels", "ix_a", 1),
-          "ALTER INDEX ... DISABLE is read as a removal, as sp_IndexCleanup "
+          "alter index ... disable is read as a removal, as sp_IndexCleanup "
           "scripts it")
     check(parse_drops("ALTER INDEX a ON gis.t REBUILD;\n"
                       "ALTER INDEX b ON gis.t REBUILD\n"
@@ -1485,7 +1504,7 @@ def self_test():
           == [("gis", "t", "c", 3), ("gis", "t", "d", 4)],
           "a rebuild is not a removal  <-- pinned defect")
     raises(lambda: parse_drops("ALTER INDEX ALL ON gis.t DISABLE;"),
-           "ALTER INDEX ALL ... DISABLE is refused", "line 1")
+           "alter index all ... disable is refused", "line 1")
     raises(lambda: parse_drops("ALTER INDEX a ON DISABLE;"),
            "an unreadable ALTER INDEX is refused, never skipped",
            "ALTER INDEX name ON schema.table DISABLE")
@@ -1507,7 +1526,7 @@ def self_test():
            "refused", "holds no DROP INDEX")
     check(parse_drops("ALTER TABLE [db].[gis].[parcels] DROP CONSTRAINT "
                       "[uq_x];") == [("gis", "parcels", "uq_x", 1)],
-          "ALTER TABLE ... DROP CONSTRAINT is read as a removal, as "
+          "alter table ... drop constraint is read as a removal, as "
           "sp_IndexCleanup scripts it  <-- pinned defect")
     check(parse_drops("alter table gis.t drop constraint if exists uq_x")[0] ==
           ("gis", "t", "uq_x", 1), "IF EXISTS and lower case are read on a "
@@ -1530,7 +1549,7 @@ def self_test():
     raises(lambda: parse_drops("DROP INDEX b ON gis.t;\ncreate index a on "
                                "gis.t (z) with (drop_existing=on)"),
            "the rewrite is found after a drop and in lower case", "line 2")
-    raises(lambda: parse_drops("DROP TABLE gis.a_7;"), "DROP TABLE is refused, "
+    raises(lambda: parse_drops("DROP TABLE gis.a_7;"), "drop table is refused, "
            "it removes every index on the table  <-- pinned defect",
            "DROP TABLE removes every index")
     check(parse_drops("ALTER TABLE gis.t ADD c int;\n"
@@ -1622,6 +1641,50 @@ def self_test():
         raises(lambda: parse_drops(bad), "a string, name or comment that "
                "never closes is refused: %s" % bad.split()[0], "never closes")
 
+    # Statements the scanner and the target patterns must still see.
+    check(parse_drops("/* a */ DROP INDEX x ON gis.t; /* b */\n"
+                      "DROP INDEX y ON gis.t;") ==
+          [("gis", "t", "x", 1), ("gis", "t", "y", 2)],
+          "a statement between two block comments is read  <-- pinned defect")
+    check(parse_drops("alter index a on gis.t disable;\n"
+                      "alter table gis.t drop constraint b;") ==
+          [("gis", "t", "a", 1), ("gis", "t", "b", 2)],
+          "a lower-case alter index ... disable is read  <-- pinned defect")
+    raises(lambda: parse_drops("alter index all on gis.t disable;"),
+           "a lower-case alter index all is refused", "line 1")
+    raises(lambda: parse_drops("DROP INDEX a ON gis.t WITH(ONLINE = ON), "
+                               "b ON gis.t;"),
+           "a second index after WITH( with no space is refused  "
+           "<-- pinned defect", "several indexes")
+    for lead in ("DROP INDEX a ON gis.t\n, b ON gis.t;",
+                 "DROP INDEX a ON gis.t , b ON gis.t;"):
+        raises(lambda: parse_drops(lead), "white space before the comma of a "
+               "second index does not hide it  <-- pinned defect",
+               "several indexes")
+    check([d[2] for d in parse_drops("PRINT 'it''s'; PRINT 'b'; DROP INDEX a "
+                                     "ON gis.t;")] == ["a"],
+          "a doubled quote in a script with two strings stays in its string")
+    check(parse_drops("ALTER TABLE gis.t DROP uq_x;") == [("gis", "t", "uq_x", 1)]
+          and parse_drops("alter table gis.t drop if exists [uq_x]")[0][2] ==
+          "uq_x",
+          "a constraint drop with no CONSTRAINT keyword is read as a removal  "
+          "<-- pinned defect")
+    raises(lambda: parse_drops("ALTER TABLE gis.t DROP uq_x, uq_y;"),
+           "a keyword-less drop naming two constraints is refused",
+           "several indexes")
+    raises(lambda: parse_drops("ALTER TABLE srv.db.gis.t DROP uq_x;"),
+           "a keyword-less drop on a four-part name is refused, not skipped",
+           "ALTER TABLE schema.table DROP CONSTRAINT name")
+    check(parse_drops("ALTER TABLE gis.t DROP COLUMN c;\n"
+                      "ALTER TABLE gis.t ALTER COLUMN c DROP ROWGUIDCOL;\n"
+                      "ALTER TABLE gis.t DROP PERIOD FOR SYSTEM_TIME;\n"
+                      "DROP INDEX a ON gis.t;") == [("gis", "t", "a", 4)],
+          "dropping a column, a period or a column property is not a removal")
+    raises(lambda: parse_drops("\nUSE db2"), "a USE refusal after a leading "
+           "newline names line 2", "line 2:")
+    raises(lambda: parse_drops("\nPRINT 'open"), "an unclosed string after a "
+           "leading newline names line 2", "line 2:")
+
     # ---- the script
     script = drop_script([(twin_model.units[0], "reason one")], "a.sql")
     check(script.count("DROP INDEX") == 2 and "twin pair" in script and
@@ -1644,6 +1707,23 @@ def self_test():
     single = drop_script([(solo.units[0], "r")], "the plan")
     check("twin pair" not in single and single.count("DROP INDEX") == 1,
           "a single index has no twin comment")
+    twin_script = drop_script([(twin_model.units[0], "reason one")], "a.sql")
+    check(twin_script.splitlines() == [
+        "-- sdeindex drop script: 2 index(es) in 1 unit(s), from a.sql.",
+        "-- Read it, then run it yourself. sdeindex runs nothing.",
+        "-- A dropped index is gone. Script its CREATE INDEX first if you may "
+        "want it back.",
+        "",
+        "-- reason one",
+        "-- twin pair: base table and adds table, dropped together",
+        "DROP INDEX [ix_zone] ON [gis].[parcels];",
+        "DROP INDEX [ix_zone] ON [gis].[a_7];"] and
+        twin_script.endswith(";\n") and "\r" not in twin_script,
+        "the script is exactly the comments and the DROP INDEX lines, one per "
+        "line  <-- pinned defect")
+    check(single.splitlines()[4:] == ["-- r", "DROP INDEX [ix_a] ON "
+                                      "[gis].[parcels];"],
+          "a single index writes its reason and one DROP INDEX line")
 
     # ---- reading CSV text
     raises(lambda: read_rows("", INDEX_COLUMNS, "the export"),
@@ -1736,6 +1816,13 @@ def self_test():
           in body and units == [],
           "a DROP CONSTRAINT on a read unique constraint is refused, not "
           "skipped  <-- pinned defect")
+    lines, code, units = analyse(cons, None,
+        "DROP INDEX ix_x ON gis.parcels;\n"
+        "ALTER TABLE gis.parcels DROP uq_parcel_id;")
+    check(code == 1 and "REFUSED   [gis].[parcels].[uq_parcel_id]  backs a "
+          "UNIQUE constraint" in "\n".join(lines),
+          "a keyword-less constraint drop next to another drop is refused, "
+          "not skipped into a clean exit  <-- pinned defect")
     lines, code, units = analyse(cons, None, "DROP INDEX ix_x ON gis.parcels;")
     check(code == 1 and units == [] and "could not be proven safe" in
           lines[-1],
@@ -1870,6 +1957,33 @@ def self_test():
             globals()["self_test"] = real_self_test
         check(code == 7, "--self-test exits with the code the self-test "
               "returns  <-- pinned defect")
+
+        # A crash must not look like a finding: exit 1 is for a refused audit.
+        class Broken(object):
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                pass
+        err = io.StringIO()
+        with contextlib.redirect_stdout(Broken()), \
+                contextlib.redirect_stderr(err):
+            code = main([idx, "--registry", reg])
+        check(code == 2 and "error: [Errno 32] Broken pipe" in err.getvalue(),
+              "a closed output pipe exits 2, not the 1 of a refused audit  "
+              "<-- pinned defect")
+        real_analyse = globals()["analyse"]
+
+        def boom(*args):
+            raise ValueError("boom")
+        globals()["analyse"] = boom
+        try:
+            code, out, err = run([idx, "--registry", reg])
+        finally:
+            globals()["analyse"] = real_analyse
+        check(code == 2 and "ValueError: boom" in err and out == "",
+              "an unexpected error prints its traceback and exits 2, not 1  "
+              "<-- pinned defect")
 
         # a real child process, with a console that cannot print the name
         accent = put("accent.csv", export([xrow("parcels", u"ix_caf\u00e9")]))
