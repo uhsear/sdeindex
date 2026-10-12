@@ -370,7 +370,6 @@ class Unit(object):
         self.members = members
         self.reads = sum(m.reads for m in members)
         self.writes = sum(m.writes for m in members)
-        self.group = None
 
     @property
     def protected(self):
@@ -391,12 +390,14 @@ class Model(object):
         self.indexes = indexes
         self.groups = groups
         self.units = [u for g in groups for u in g]
-        self.unit_of = dict((m.key, u) for u in self.units for m in u.members)
+        # An audit looks up every listed drop, so index the export once.
+        self.by_name = {}
+        for ix in indexes:
+            self.by_name.setdefault(ix.key[1:], []).append(ix)
 
     def find(self, schema, table, name):
-        return [ix for ix in self.indexes
-                if ix.key[1:] == (table.lower(), name.lower())
-                and (schema is None or ix.key[0] == schema.lower())]
+        return [ix for ix in self.by_name.get((table.lower(), name.lower()), [])
+                if schema is None or ix.key[0] == schema.lower()]
 
 
 def build(indexes, registry=None):
@@ -424,8 +425,6 @@ def build(indexes, registry=None):
         # does not matter: every unit in a group is the same index.
         units = [Unit([b, a]) for b, a in zip(base, adds)]
         units += [Unit([m]) for m in base[len(adds):] + adds[len(base):]]
-        for u in units:
-            u.group = units
         groups.append(sorted(units, key=Unit.sort_key))
     groups.sort(key=lambda g: g[0].members[0].key)
     return Model(indexes, groups)
@@ -567,7 +566,7 @@ _WITH = re.compile(r"\s*WITH\s*\(", re.I)
 # One left-to-right scan, so a '--' or '/*' inside a string or a bracketed
 # name is not a comment, and a quote inside a comment is not a string. A lone
 # quote or bracket at the end of the alternatives never closes.
-_SCAN = re.compile(r"--[^\n]*|/\*|'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]"
+_SCAN = re.compile(r"--[^\r\n]*|/\*|'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]"
                    r"|\"(?:[^\"]|\"\")*\"|['\[\"]")
 _BLOCK = re.compile(r"/\*|\*/")
 
@@ -582,7 +581,7 @@ def unquote(name):
 
 def blank(text):
     """The text with every character but a line break turned into a space."""
-    return re.sub(r"[^\n]", " ", text)
+    return re.sub(r"[^\r\n]", " ", text)
 
 
 def strip_comments(text):
@@ -770,12 +769,13 @@ def describe_audit(results):
 def audit_units(model, results):
     """The SAFE units of an audit, in plan order, for the script."""
     safe = set(label for v, label, _ in results if v == SAFE)
+    first = {}
+    for _, label, why in results:
+        first.setdefault(label, why)
     out = []
     for unit in model.units:
         if any(m.label in safe for m in unit.members):
-            reason = [r for v, label, r in results
-                      if label == unit.members[0].label][0]
-            out.append((unit, reason))
+            out.append((unit, first[unit.members[0].label]))
     return out
 
 
@@ -1528,6 +1528,17 @@ def self_test():
           "a quote inside a comment does not open a string")
     check(parse_drops("PRINT 'it''s'; DROP INDEX a ON gis.t")[0][2] == "a",
           "a doubled quote stays inside its string")
+    raises(lambda: parse_drops("DROP INDEX a ON t;\n\n\nPRINT 'open"),
+           "an unclosed string past line 2 names its own line  <-- pinned "
+           "defect", "line 4:")
+    check(parse_drops("ALTER INDEX a ON gis.t REBUILD\n"
+                      "ALTER INDEX b ON gis.t DISABLE") == [("gis", "t", "b", 2)],
+          "a rebuild next to a disable at the end of the file is not read as "
+          "one statement  <-- pinned defect")
+    check([d[2] for d in parse_drops("DROP INDEX a ON gis.t;\r-- note\r"
+                                     "DROP INDEX b ON gis.t;\r")] == ["a", "b"],
+          "a '--' comment ends at a bare CR, so the DROP after it is read  "
+          "<-- pinned defect")
     for bad in ("PRINT 'open; DROP INDEX a ON gis.t", "/* open\nDROP INDEX a "
                 "ON gis.t", "DROP INDEX [a ON gis.t", 'DROP INDEX "a ON t'):
         raises(lambda: parse_drops(bad), "a string, name or comment that "
@@ -1613,6 +1624,27 @@ def self_test():
     lines, code, units = analyse(story, REG_CSV,
                                  "DROP INDEX ix_owner_2 ON gis.parcels;")
     check(code == 0 and len(units) == 1, "a clean list exits 0")
+    three = export([xrow("parcels", "ix_a"),
+                    xrow("parcels", "ix_b", keys="[z] ASC"),
+                    xrow("parcels", "ix_c", keys="[y] ASC")], "720")
+    lines, code, units = analyse(three, None,
+                                 "DROP INDEX ix_b ON gis.parcels;\n"
+                                 "DROP INDEX nope ON gis.parcels;\n"
+                                 "DROP INDEX ix_c ON gis.parcels;\n")
+    check(code == 1 and "REFUSED   [gis].[parcels].[nope]  line 2: [nope] is "
+          "not in the index export" in "\n".join(lines),
+          "a missing name in the middle of a list is refused with its own "
+          "label and line  <-- pinned defect")
+    check(len(units) == 2, "the two listed indexes around it are still judged")
+    pair = [xrow("zz", "ix1", keys="[z] ASC"), xrow("aa", "ix2", keys="[a] ASC")]
+    check(analyse(export(pair, "720"))[0] ==
+          analyse(export(pair[::-1], "720"))[0],
+          "the plan reads the same for a reordered export  <-- pinned defect")
+    check(analyse(export(pair, "720"), None, "DROP INDEX ix1 ON gis.zz;\n"
+                  "DROP INDEX ix2 ON gis.aa;")[0] == analyse(
+                      export(pair[::-1], "720"), None,
+                      "DROP INDEX ix1 ON gis.zz;\nDROP INDEX ix2 ON gis.aa;")[0],
+          "an audit reads the same for a reordered export")
     cons = export([
         xrow("parcels", "uq_parcel_id", keys="[parcel_id] ASC", uniq=1, uc=1,
              seeks=900),

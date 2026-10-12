@@ -44,6 +44,8 @@ PASS  an audit of a merge script is refused whole, not judged against an index t
 ...
 PASS  a '--' inside a string does not hide the DROP after it  <-- pinned defect
 ...
+PASS  a '--' comment ends at a bare CR, so the DROP after it is read  <-- pinned defect
+...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
 ...
 PASS  --out without --apply writes nothing  <-- pinned defect
@@ -51,7 +53,7 @@ PASS  --out without --apply writes nothing  <-- pinned defect
 PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned defect
 ...
 --------------------------------------------------------------------
-229 assertions, 0 failed
+236 assertions, 0 failed
 ```
 
 ## What already exists
@@ -72,10 +74,10 @@ holds none of their code.
   less, unless you pass `-IgnoreUptime`.
 
 I searched the source of sp_IndexCleanup, sp_BlitzIndex and the two dbatools commands for
-geodatabase terms. sp_IndexCleanup and the two commands hold none. sp_BlitzIndex holds one hit,
-which is about temporal tables. So none of them knows that
-`a_7` is the adds table of another table, or that an index named `r7_sde_rowid_uk` belongs to the
-geodatabase. And each one judges its own run. A script that someone built from two runs has no
+geodatabase terms: `geodatabase`, `esri`, `sde_` and `arcgis`, ignoring case. None of the four
+holds any of them. So none of them knows that
+`a_7` is the adds table of another table, or that an index named `r7_sde_rowid_uk` is assumed to
+belong to the geodatabase. And each one judges its own run. A script that someone built from two runs has no
 keeper, and no tool above checks it.
 
 This tool adds two things. It knows the geodatabase rules. And its audit mode reads any script of
@@ -90,7 +92,7 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts one child Python process.
 
-The self-test prints the same 229 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
+The self-test prints the same 236 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
 Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches. I
@@ -300,7 +302,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   same number as a registry row in the same schema, the tool treats it as that registration's
   adds table.
 - The uptime floor covers an engine restart only. A database detach or an `AUTO_CLOSE` shutdown
-  clears the rows for one database, and the export cannot show that. The floor of 14 days is
+  clears the rows for one database, and the export cannot show that. A database that was restored
+  or re-attached lately, on an instance that has run for months, shows only the counters since
+  then, and the floor measures the instance, not the database. The floor of 14 days is
   borrowed from sp_IndexCleanup and is not measured. A report that runs once a quarter reads its
   index four times a year, and no short floor sees it.
 - Usage counters belong to one instance. On an Always On readable secondary, reads served there
@@ -308,8 +312,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   Microsoft page that states this for Always On. It is my reading of how the counters work. Export from every
   replica that serves reads, or treat an unread verdict as unproven.
 - The registry must come from the same database as the index export. A delta table with no
-  registry row is kept as unproven, but the base-table index it twins is judged alone, which can
-  leave half a pair. A registry row with a blank `table_name` pairs nothing, for the same reason.
+  registry row is protected in a plan and refused (`REFUSED`, exit 1) in an audit. The base-table
+  index it twins is judged alone, which can leave half a pair. A registry row with a blank `table_name` pairs nothing, for the same reason.
 - Filter text is compared with its white space collapsed. Two filters that differ only in the
   spacing inside a string, such as `[status]='a  b'` and `[status]='a b'`, count as identical.
 - Names are compared with case folded. In a case-sensitive database, two indexes or columns whose
@@ -320,6 +324,21 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - Only nonclustered indexes are judged. The export query leaves out disabled and hypothetical
   indexes. Compression, partitioning, fill factor, filegroup and data space are not compared, so two
   indexes that differ only in those count as identical. The tool can drop a compressed copy and keep an uncompressed one.
+- The uptime line rounds to one decimal place. An export taken after 335 hours prints
+  `14.0 days of usage counters, floor 14 days, so no index is called unused`. The line reads as
+  contradictory, but 335 hours is under 14 days and the verdict is right.
+- The `KEEP` line of a plan counts a group of identical copies as read when any copy was read. If
+  an unread twin pair and a read single copy are identical, the plan drops the read copy, keeps the
+  pair, and reports the pair as `1 read`. The drop is sound, because the reads move to the
+  surviving copy. The count describes the group, not the unit that stays.
+- The tool knows the delta tables `a_<id>` and `d_<id>` and the `SDE_` and `GDB_` system tables.
+  Raster, legacy binary-geometry and other companion tables that the geodatabase creates for a
+  registered table get no ownership rule. An index on one is judged as an ordinary index. The
+  unique, spatial and primary-key rules protect most of them. I could not confirm the SQL Server
+  companion-table names from Esri documentation.
+- The self-test cannot catch a fault in its own harness. If `Recorder.finish` were broken so that
+  it printed `0 failed` and returned 0 while a `FAIL` line was printed, a gate that reads only the
+  exit code and the footer would pass. Read the `FAIL` lines, or the whole output, in CI.
 - It does not see a hint in a query, a plan guide, or a foreign key that leans on an index. A
   forced index name in application code breaks when the index drops, and the counters do not warn.
 - In an audit, every other statement is skipped without a message. That includes `DROP STATISTICS`
@@ -330,6 +349,16 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   that is not an index, such as a foreign key, is refused as not in the index export.
   `ALTER TABLE t DROP COLUMN c, CONSTRAINT k` is not read as a constraint removal. It is skipped
   silently next to other statements, and exits 3 as "no DROP statement" if it is the only one.
+  `ALTER TABLE t DROP uq_x`, with the `CONSTRAINT` keyword left out, is valid T-SQL
+  ([Microsoft, ALTER TABLE](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql)
+  makes the keyword optional). The audit does not read it as a removal, and it is skipped in the
+  same way.
+- `CREATE SPATIAL INDEX`, `CREATE XML INDEX` and `CREATE NONCLUSTERED HASH INDEX` with
+  `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
+  index that the tool judges can be rewritten by those forms, so no verdict changes.
+- An exit 0 from an audit means that every removal the tool could read is safe. It does not mean
+  the script is safe. A removal that the tool skips, such as `ALTER TABLE ... DROP COLUMN c,
+  CONSTRAINT k` or `ALTER TABLE t DROP uq_x`, can sit in a script that exits 0.
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
 - Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
@@ -338,12 +367,18 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
   `UNPROVEN`, and `--apply` can write a drop the author did not list.
 - Do not put a semicolon inside an index, table or constraint name. An `ALTER` statement with one
-  is skipped without a message. A four-part table name (server.db.schema.table) is refused as not
-  in the export. Remove the server part.
+  is skipped without a message, so `ALTER INDEX [ix_a;b] ON gis.parcels DISABLE;` next to a safe
+  `DROP INDEX` can exit 0 with that removal unjudged.
+- A four-part table name (server.db.schema.table) is split as schema `db` and table `gis`, because
+  the tool reads at most three parts. It is refused only because that pair is not in the export.
+  The refusal is right, but the label names the wrong table, such as `[db].[gis].[ix_q]`. Remove
+  the server part.
 - A script that disables an index that an earlier run already disabled is refused as not in the
   index export, because the export query leaves out disabled indexes.
-- End every statement in an audited script with a semicolon. Without one, a statement that has no
-  semicolon can pull in the words of the next statement and be refused as unreadable.
+- End every statement in an audited script with a semicolon. Without one, a statement can pull in
+  the words of the next one. `ALTER INDEX ix_q ON gis.parcels REBUILD` followed by
+  `DISABLE TRIGGER trg ON DATABASE;` on the next line is read as one statement with a `DISABLE`
+  in it, and the run exits 3 as unreadable.
 - The database part of a three-part table name, and any `USE` statement, is ignored. Audit a
   script only against the export of the database it was written for. An index target with no
   schema (`ON parcels`) is matched to the one schema that holds that table in the export, but SQL
@@ -359,8 +394,12 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   ANSI when you open such a file. The tool reads a BOM and UTF-16 on input.
 - The tool reads the whole export into memory. A counter or an uptime of more than 19 digits is
   refused. An audit matches each listed drop against every index, so the time grows with listed
-  drops times indexes. I measured 3000 indexes with 1000 drops in about a second, and 30000
-  indexes with 10000 drops in 144 seconds, on Windows with Python 3.13.
+  drops times indexes. I measured it on Windows with Python 3.13, on a synthetic export of five
+  indexes per table, three key shapes and a third of the indexes listed. 3000 indexes with 1000
+  drops took 0.1 seconds. 30000 indexes with 10000 drops took 3.5 seconds. The time depends on the
+  shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
+  square of its length to scan, about 22 seconds here, because each statement looks ahead for its
+  end.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
   tool cannot detect the cut.
@@ -370,12 +409,18 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   UTF-8 or UTF-16. UTF-16 with no byte order mark gets the missing-columns refusal.
 - Spaces at the start or end of an index or table name are stripped when the CSV is read, so a
   script written for such a name would name a different index. A NUL byte in a field is read as it
-  is and printed unchanged. A name that differs from SQL Server's only by Unicode normalisation is
-  read as it is.
+  is and printed unchanged on Python 3.11 and later. On Python 3.9 and 3.10 the `csv` module
+  raises "line contains NUL", and the run exits 3 as not readable CSV. A name that differs from
+  SQL Server's only by Unicode normalisation is read as it is.
+- A `--` comment ends at a CR or an LF, so a script with bare CR line endings reads correctly.
+  Line numbers in messages count LF only, so such a script reports every line as line 1.
 - Only CR and LF are written out as `\r` and `\n` in the `--` comment lines of the script. Other
   Unicode line separators in a name are written as they are.
-- A file name that is not valid UTF-8 can make the run fail with a traceback and exit 1, which is
-  also the code of a refused audit. It can leave an empty `--out` file.
+- Any uncaught Python error ends the run with a traceback and exit 1, which is also the code of a
+  refused audit. A gate that reads only the exit code cannot tell a crash from findings. Two known
+  causes: a file name that is not valid UTF-8, which can also leave an empty `--out` file, and a
+  closed output pipe, such as `python sdeindex.py big.csv | head -1`, which fails in the first
+  `print` (an `OSError` on Windows).
 - A run that exits 3 writes nothing. A run without `--apply` writes nothing. An audit that exits 1
   still writes the `SAFE` drops when you pass `--apply`. After an exit 2 from `--apply`, delete a
   partial `--out` file before you retry. On Windows, `--out NUL --apply` prints a "Wrote" line
