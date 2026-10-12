@@ -40,6 +40,8 @@ PASS  ALTER TABLE ... DROP CONSTRAINT is read as a removal, as sp_IndexCleanup s
 ...
 PASS  a second index after a WITH clause is refused, not skipped  <-- pinned defect (message names 'several indexes')
 ...
+PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
+...
 PASS  a '--' inside a string does not hide the DROP after it  <-- pinned defect
 ...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
@@ -49,7 +51,7 @@ PASS  --out without --apply writes nothing  <-- pinned defect
 PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned defect
 ...
 --------------------------------------------------------------------
-223 assertions, 0 failed
+229 assertions, 0 failed
 ```
 
 ## What already exists
@@ -88,10 +90,11 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts one child Python process.
 
-The self-test prints the same 223 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
+The self-test prints the same 229 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
 Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
-`coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches.
+`coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches. I
+measured coverage on Windows with Python 3.13.2 only, not on Python 3.9 or Linux.
 
 ```
 git clone https://github.com/uhsear/sdeindex.git
@@ -229,7 +232,8 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index. |
 | `ALTER TABLE schema.table DROP CONSTRAINT name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
-| `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements | Not removals. Skipped. |
+| `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
+| Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements | Not removals. Skipped. |
 
 A statement with several targets, such as `DROP INDEX a ON t, b ON t`, is refused with exit 3. So is
 `ALTER INDEX ALL`. Comments are ignored. A `--` or `/*` inside a string or a bracketed name does
@@ -278,7 +282,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   `sys.dm_db_index_usage_stats`. The self-test checks that each query writes each column the
   tool reads. It cannot check that the T-SQL runs. Run it on a test copy first. If it fails,
   that is a bug, and the fix is in `INDEX_QUERY`. The registry query reads `sde.SDE_table_registry`.
-  Use `dbo.SDE_table_registry` where the geodatabase system tables sit in the `dbo` schema.
+  Use `dbo.SDE_table_registry` where the geodatabase system tables sit in the `dbo` schema. The
+  column names of `SDE_table_registry` come from memory, not from Esri documentation. A wrong name
+  fails loudly when the registry query runs.
 - The delta-table rules rest on Esri's documented names. Esri's SQL Server help names the adds and
   deletes tables. It names no index on them. The tool assumes the Oracle column names hold in SQL
   Server, and protects any adds-table index over one of them. The pattern `r<id>_sde_rowid_uk` is
@@ -297,19 +303,45 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   clears the rows for one database, and the export cannot show that. The floor of 14 days is
   borrowed from sp_IndexCleanup and is not measured. A report that runs once a quarter reads its
   index four times a year, and no short floor sees it.
-- Usage counters belong to one replica. On an Always On readable secondary, reads served there are
-  not in the primary's export, so an index can look unread when it is used. Export from every
+- Usage counters belong to one instance. On an Always On readable secondary, reads served there
+  are not in the primary's export, so an index can look unread when it is used. I found no
+  Microsoft page that states this for Always On. It is my reading of how the counters work. Export from every
   replica that serves reads, or treat an unread verdict as unproven.
+- The registry must come from the same database as the index export. A delta table with no
+  registry row is kept as unproven, but the base-table index it twins is judged alone, which can
+  leave half a pair. A registry row with a blank `table_name` pairs nothing, for the same reason.
+- Filter text is compared with its white space collapsed. Two filters that differ only in the
+  spacing inside a string, such as `[status]='a  b'` and `[status]='a b'`, count as identical.
+- Names are compared with case folded. In a case-sensitive database, two indexes or columns whose
+  names differ only in case can be read as one, and a case-sensitive export with two such names
+  exits 3. Python folds Unicode case, the database collation does not.
+- `--min-uptime-days 0` turns the uptime floor off. An export taken an hour after a restart then
+  calls every unread index unused and plans a drop. That is your explicit choice.
 - Only nonclustered indexes are judged. The export query leaves out disabled and hypothetical
-  indexes. Compression, partitioning and fill factor are not compared, so two indexes that differ
-  only in those count as identical. The tool can drop a compressed copy and keep an uncompressed one.
+  indexes. Compression, partitioning, fill factor, filegroup and data space are not compared, so two
+  indexes that differ only in those count as identical. The tool can drop a compressed copy and keep an uncompressed one.
 - It does not see a hint in a query, a plan guide, or a foreign key that leans on an index. A
   forced index name in application code breaks when the index drops, and the counters do not warn.
-- In an audit, every other statement is skipped without a message. That includes `DROP STATISTICS`,
-  `TRUNCATE`, and the `CREATE INDEX ... WITH (DROP_EXISTING = ON)` merge statements that
-  sp_IndexCleanup also writes. Merge scripts that rewrite a kept index are not audited.
+- In an audit, every other statement is skipped without a message. That includes `DROP STATISTICS`
+  and `TRUNCATE`. A `CREATE INDEX ... WITH (DROP_EXISTING = ON)` statement is the exception. The
+  audit refuses it, because it rewrites an index that a drop may rely on. The merge scripts that
+  sp_IndexCleanup writes are therefore not audited as they stand.
   `ALTER TABLE ... DROP CONSTRAINT` is read as the removal of that constraint's index. A constraint
   that is not an index, such as a foreign key, is refused as not in the index export.
+  `ALTER TABLE t DROP COLUMN c, CONSTRAINT k` is not read as a constraint removal. It is skipped
+  silently next to other statements, and exits 3 as "no DROP statement" if it is the only one.
+- A script with no removal statement at all is refused as the wrong file. A script of only
+  `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
+- Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
+  read. A removal built by joining string pieces inside `EXEC` is not seen.
+- A `DROP INDEX`, `ALTER INDEX ... DISABLE` or `DROP CONSTRAINT` phrase inside a string, such as
+  `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
+  `UNPROVEN`, and `--apply` can write a drop the author did not list.
+- Do not put a semicolon inside an index, table or constraint name. An `ALTER` statement with one
+  is skipped without a message. A four-part table name (server.db.schema.table) is refused as not
+  in the export. Remove the server part.
+- A script that disables an index that an earlier run already disabled is refused as not in the
+  index export, because the export query leaves out disabled indexes.
 - End every statement in an audited script with a semicolon. Without one, a statement that has no
   semicolon can pull in the words of the next statement and be refused as unreadable.
 - The database part of a three-part table name, and any `USE` statement, is ignored. Audit a
@@ -325,15 +357,34 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the brackets, as T-SQL allows. Read the script before you run it.
 - The script is written as UTF-8 with no byte order mark. SSMS can read a non-ASCII index name as
   ANSI when you open such a file. The tool reads a BOM and UTF-16 on input.
-- The tool reads the whole export into memory. I did not measure a large export. A counter or an
-  uptime of more than 19 digits is refused.
+- The tool reads the whole export into memory. A counter or an uptime of more than 19 digits is
+  refused. An audit matches each listed drop against every index, so the time grows with listed
+  drops times indexes. I measured 3000 indexes with 1000 drops in about a second, and 30000
+  indexes with 10000 drops in 144 seconds, on Windows with Python 3.13.
+- Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
+  there by default, and a column list cut short can make two different indexes look identical. The
+  tool cannot detect the cut.
+- The CSV must be UTF-8 or UTF-16 with a header row and a comma delimiter. A `;` or tab delimiter,
+  or a `#TYPE` first line from Windows PowerShell `Export-Csv`, exits 3 with a missing-columns
+  message that does not name the delimiter. A legacy ANSI file, such as cp1252, exits 3 as not
+  UTF-8 or UTF-16. UTF-16 with no byte order mark gets the missing-columns refusal.
+- Spaces at the start or end of an index or table name are stripped when the CSV is read, so a
+  script written for such a name would name a different index. A NUL byte in a field is read as it
+  is and printed unchanged. A name that differs from SQL Server's only by Unicode normalisation is
+  read as it is.
+- Only CR and LF are written out as `\r` and `\n` in the `--` comment lines of the script. Other
+  Unicode line separators in a name are written as they are.
+- A file name that is not valid UTF-8 can make the run fail with a traceback and exit 1, which is
+  also the code of a refused audit. It can leave an empty `--out` file.
 - A run that exits 3 writes nothing. A run without `--apply` writes nothing. An audit that exits 1
   still writes the `SAFE` drops when you pass `--apply`. After an exit 2 from `--apply`, delete a
   partial `--out` file before you retry. On Windows, `--out NUL --apply` prints a "Wrote" line
   although nothing is kept. Only `--self-test` writes anything else, a temporary directory that it
   removes.
-- It opens no socket, imports no network module and reads no password, token or environment
-  variable. The self-test reads its own source and checks the imports. A refusal quotes the value
+- It opens no socket, imports no network module and reads no password or token. The normal plan
+  and audit paths read no environment variable. Only `--self-test` touches the environment: it
+  copies it into its one child Python process, which prints none of it. The self-test reads its
+  own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
 
 ## Contributing
@@ -353,9 +404,9 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [gdbprune](https://github.com/uhsear/gdbprune) - delete stale leaf versions from a
-  traditionally versioned geodatabase, with a plan first. Run it, then a compress, before an index
-  cleanup, so the usage counters and the adds tables describe the current data.
+  traditionally versioned geodatabase, with a plan first.
 - [compressfloor](https://github.com/uhsear/compressfloor) - name what holds the compress floor.
   It reads exported system tables, as this tool reads an exported index list.
-- [safe-republish](https://github.com/uhsear/safe-republish) - the same refusal to act on a list
-  that nobody checked, applied to a feature class truncate.
+- [safe-republish](https://github.com/uhsear/safe-republish) - a plausibility check on a staged
+  replacement before a feature class truncate. It guards a different step with the same habit of
+  refusing before it acts.

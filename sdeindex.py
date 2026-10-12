@@ -341,7 +341,8 @@ def classify(ix, registry):
                       "table, and no --registry was given. Without the "
                       "registry the twin of every versioned index is unknown."
                       % (ix.label, ix.table))
-    entry = registry.get(int(m.group(2)))
+    # Digits that int() cannot take (4300 or more on Python 3.11) name no row.
+    entry = registry.get(int(m.group(2))) if whole(m.group(2)) else None
     if entry is not None and entry[1] == ix.key[1] and entry[0] == ix.key[0]:
         # A table that is itself registered under the name a5 is not the
         # adds table of anything.
@@ -555,7 +556,10 @@ _CONSTRAINT = re.compile(
     r"ALTER\s+TABLE\s+(?P<table>%s)\s+DROP\s+CONSTRAINT\s+"
     r"(?:IF\s+EXISTS\s+)?(?P<name>%s)" % (_TABLE, _NAME), re.I)
 _WORDS = re.compile(
-    r"\b(DROP\s+INDEX|ALTER\s+INDEX|ALTER\s+TABLE|DROP\s+TABLE)\b", re.I)
+    r"\b(DROP\s+INDEX|ALTER\s+INDEX|ALTER\s+TABLE|DROP\s+TABLE|"
+    r"CREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?(?:COLUMNSTORE\s+)?"
+    r"INDEX)\b", re.I)
+_REWRITE = re.compile(r"\bDROP_EXISTING\s*=\s*ON\b", re.I)
 _DISABLE = re.compile(r"\bDISABLE\b", re.I)
 _DROP_CONSTRAINT = re.compile(r"\bDROP\s+CONSTRAINT\b", re.I)
 _WITH = re.compile(r"\s*WITH\s*\(", re.I)
@@ -657,6 +661,15 @@ def parse_drops(text):
             stops = [len(clean)] + [i for i in (
                 clean.find(";", word.start()),
                 words[n + 1].start() if n + 1 < len(words) else -1) if i >= 0]
+            if kind.startswith("CREATE"):
+                # A rewrite of an index changes the copy a drop says "stays".
+                if _REWRITE.search(clean, word.start(), min(stops)):
+                    raise Refused(
+                        "line %d: CREATE INDEX ... DROP_EXISTING = ON "
+                        "rewrites an index, so a copy that a drop leaves "
+                        "behind may not be the index judged. Audit the DROP "
+                        "statements in a file of their own." % line)
+                continue
             marker = _DISABLE if kind == "ALTER INDEX" else _DROP_CONSTRAINT
             if not marker.search(clean, word.start(), min(stops)):
                 continue
@@ -1179,6 +1192,13 @@ def self_test():
           "a delta-named table with no registry row is protected")
     check("no registry row" in cls("ix", "a_7", schema="other")[1],
           "a delta-named table owned by another schema is protected")
+    check("no registry row in schema gis owns id 7" in
+          cls("ix", "a_7", reg={7: ("other", "a_7")})[1],
+          "a table a_7 in schema gis is not owned by a registry row for a_7 "
+          "under another owner  <-- pinned defect")
+    check("no registry row" in cls("ix", "a" + "9" * 5000)[1],
+          "a delta-named table with 5000 digits is protected, not a crash  "
+          "<-- pinned defect")
     check(cls("ix", "d_5", reg={5: ("gis", "d_5")}) ==
           (("gis", "d_5"), None),
           "a table registered under the name d_5 is not a deletes table  "
@@ -1457,6 +1477,18 @@ def self_test():
     raises(lambda: parse_drops("ALTER TABLE gis.t DROP CONSTRAINT ;"),
            "an unreadable constraint drop is refused, never skipped",
            "ALTER TABLE schema.table DROP CONSTRAINT name")
+    raises(lambda: parse_drops("CREATE NONCLUSTERED INDEX a ON gis.t ([z]) "
+                               "WITH (DROP_EXISTING = ON);\nDROP INDEX b ON "
+                               "gis.t;"),
+           "a CREATE INDEX that rewrites an index is refused, not skipped  "
+           "<-- pinned defect", "DROP_EXISTING")
+    check(parse_drops("create unique clustered columnstore index a on gis.t "
+                      "(z);\nCREATE INDEX c ON gis.t (y) WITH (ONLINE = ON)\n"
+                      "DROP INDEX b ON gis.t;") == [("gis", "t", "b", 3)],
+          "a CREATE INDEX that rewrites nothing is skipped, in any case")
+    raises(lambda: parse_drops("DROP INDEX b ON gis.t;\ncreate index a on "
+                               "gis.t (z) with (drop_existing=on)"),
+           "the rewrite is found after a drop and in lower case", "line 2")
     raises(lambda: parse_drops("DROP TABLE gis.a_7;"), "DROP TABLE is refused, "
            "it removes every index on the table  <-- pinned defect",
            "DROP TABLE removes every index")
@@ -1601,6 +1633,12 @@ def self_test():
     raises(lambda: analyse(story, REG_CSV, "DROP INDEX ix_owner_2 ON "
                            "gis.parcels;\nDROP TABLE gis.a_7;"),
            "a list with a DROP TABLE is refused whole", "DROP TABLE")
+    raises(lambda: analyse(story, REG_CSV, "CREATE NONCLUSTERED INDEX "
+                           "ix_owner_1 ON gis.parcels ([zone] ASC) WITH "
+                           "(DROP_EXISTING = ON);\nDROP INDEX ix_owner_2 ON "
+                           "gis.parcels;"),
+           "an audit of a merge script is refused whole, not judged against "
+           "an index the script rewrites  <-- pinned defect", "DROP_EXISTING")
     raises(lambda: analyse(story), "a geodatabase export with adds tables and "
            "no registry is refused", "no --registry was given")
     raises(lambda: analyse("schema_name\nx\n"), "an export missing columns is "
