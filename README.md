@@ -2,8 +2,8 @@
 
 Plan or audit an index cleanup for an enterprise geodatabase in SQL Server. Refuses a drop list
 that removes both copies of an identical pair, and refuses half of a base-table and adds-table
-twin. Protects the indexes the geodatabase owns. Holds every "unused" verdict until the usage
-counters cover enough uptime.
+twin. Protects the indexes the geodatabase owns. Holds every "unused" verdict until the SQL Server
+instance has run long enough for the usage counters to mean something.
 
 A parcel layer is versioned. Its table has a nonclustered index on the owner column. The index is
 there twice, because two people added it a year apart. A report lists the indexes nobody reads,
@@ -44,6 +44,8 @@ PASS  a '--' inside a string does not hide the DROP after it  <-- pinned defect
 ...
 PASS  a '--' comment ends at a bare CR, so the DROP after it is read  <-- pinned defect
 ...
+PASS  a USE statement is refused, so a script for another database is not judged against this export  <-- pinned defect (message names 'USE switches database')
+...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
@@ -53,7 +55,7 @@ PASS  --out without --apply writes nothing  <-- pinned defect
 PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned defect
 ...
 --------------------------------------------------------------------
-236 assertions, 0 failed
+254 assertions, 0 failed
 ```
 
 ## What already exists
@@ -82,7 +84,8 @@ keeper, and no tool above checks it.
 
 This tool adds two things. It knows the geodatabase rules. And its audit mode reads any script of
 `DROP INDEX`, `ALTER INDEX ... DISABLE` or `ALTER TABLE ... DROP CONSTRAINT` statements, including
-the one sp_IndexCleanup writes, and judges the whole script against the export. A name search of
+the `DISABLE` and `DROP CONSTRAINT` scripts that sp_IndexCleanup writes, and judges the whole
+script against the export. A name search of
 GitHub for `sdeindex` found no other repository on 2026-10-12.
 
 ## Requirements
@@ -92,8 +95,8 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts one child Python process.
 
-The self-test prints the same 236 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
-Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
+The self-test prints the same 254 assertions on Windows (Python 3.13.2), on Windows with Python
+3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches. I
 measured coverage on Windows with Python 3.13.2 only, not on Python 3.9 or Linux.
@@ -132,6 +135,9 @@ python sdeindex.py indexes.csv --registry registry.csv --drops naive.sql --out s
 | `--apply` | off | Write the script to `--out`. Without it nothing is written. |
 | `--print-query` | off | Print the two export queries and exit. |
 | `--self-test` | off | Run the offline assertions and exit. |
+
+`--self-test` ignores any other argument: `python sdeindex.py --self-test indexes.csv` runs the
+self-test and exits 0.
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--appl` is refused
 with exit 64 instead of being read as `--apply`.
@@ -234,6 +240,7 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index. |
 | `ALTER TABLE schema.table DROP CONSTRAINT name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
+| `USE database` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. |
 | `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
 | Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements | Not removals. Skipped. |
 
@@ -253,11 +260,11 @@ Each rule below has assertions in the self-test. The label says where.
 | An adds-table index and its base-table twin go together or not at all. | Half a pair is neither the old state nor the new one. | Self-test, "without its adds twin". |
 | A read on either twin keeps the pair. | The counters of the two tables are separate. | Self-test, "a read on the adds twin". |
 | Indexes on `a_<id>` and `d_<id>` are judged only when `--registry` proves the table. | Esri names the delta tables `a_<registration_id>` and `d_<registration_id>`, in the schema of the versioned table. | [Esri, geodatabase system tables in SQL Server](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-sql-server/geodatabase-system-tables-sqlserver.html) |
-| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents indexes over these columns on its delta tables. The tool does not protect a base-table index by column name. | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
+| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents `D<n>_PK` over `DELETED_AT` in prose and `sde_deleted_at` in a table, and indexes over `SDE_STATE_ID` and `SDE_DELETES_ROW_ID`, on its delta tables. The tool does not protect a base-table index by column name. | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
 | Anything in the `sde` schema, or on an `SDE_` or `GDB_` table, is never dropped. | These are geodatabase system tables. | The Esri page above lists both prefixes. |
-| The ObjectID index is never dropped. | Esri's SDK help: "An attribute index on object id cannot be deleted." The index is unique, and the unique rule protects it. | [Esri, SchemaBuilder.Delete](https://doc.esri.com/en/arcgis-pro/latest/sdk/api-reference/topic40928.html) |
+| The ObjectID index is never dropped. | Esri's SDK help: "An attribute index on object id cannot be deleted." The index is unique, and the unique rule protects it. Esri's Oracle help names it `R<N>_SDE_ROWID_UK`, and the tool also protects that pattern by name. | [Esri, SchemaBuilder.Delete](https://doc.esri.com/en/arcgis-pro/latest/sdk/api-reference/topic40928.html) |
 | Primary key, unique constraint, unique, spatial, hash and clustered indexes are never dropped. | Some enforce a rule. The counters never see spatial and memory-optimized indexes. | [Microsoft, sys.dm_db_index_usage_stats](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-index-usage-stats-transact-sql) |
-| An unread index is held until the counters cover `--min-uptime-days`. | The counters start empty when the database engine starts. A detach or an `AUTO_CLOSE` shutdown also removes the rows. | The Microsoft page above, and [sys.dm_os_sys_info](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-sys-info-transact-sql) for `sqlserver_start_time`. |
+| An unread index is held until the counters cover `--min-uptime-days`. | The counters start empty when the database engine starts. A detach or an `AUTO_CLOSE` shutdown also removes the rows. The floor measures the instance, not the database. | The Microsoft page above, and [sys.dm_os_sys_info](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-sys-info-transact-sql) for `sqlserver_start_time`. |
 | With no `uptime_hours` column, no index is called unused. | The export cannot show the age of the counters. | Self-test, "no uptime". |
 
 Microsoft adds a row for an index on its first use, so a blank counter reads as 0.
@@ -289,11 +296,16 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   fails loudly when the registry query runs.
 - The delta-table rules rest on Esri's documented names. Esri's SQL Server help names the adds and
   deletes tables. It names no index on them. The tool assumes the Oracle column names hold in SQL
-  Server, and protects any adds-table index over one of them. The pattern `r<id>_sde_rowid_uk` is
-  a guess at the ObjectID index name. The unique rule protects that index whatever its name.
-- The twin rule is a precaution. Esri's documentation does not say its tools create an adds-table
-  copy of an attribute index, so the tool pairs one only when it finds one. A twin is an index on
-  the adds table with the same type, keys, includes and filter as an index on the base table.
+  Server, and protects any adds-table index over one of them. Esri's Oracle help names the
+  ObjectID index `R<N>_SDE_ROWID_UK`, and the pattern `r<id>_sde_rowid_uk` is that name with an
+  optional underscore. For SQL Server it is a guess. The unique rule protects that index whatever
+  its name. Index ownership is decided by table, column, uniqueness and type, not by the
+  Oracle-documented names `A<n>_PK`, `A<n>_STATE_ID_IX1`, `D<n>_IDX1` and `D<n>_PK`, which Esri
+  does not confirm for SQL Server.
+- The twin rule is a precaution. Esri's Oracle help says the user-defined indexes of a business
+  table are duplicated on its adds table. Its SQL Server system tables page says nothing about
+  that. The tool pairs an index only when it finds one. A twin is an index on the adds table with
+  the same type, keys, includes and filter as an index on the base table.
 - Only the delta tables of traditional versioning are recognised. Archive class tables
   (`<table>_H`, `GDB_FROM_DATE`, `GDB_TO_DATE`), branch-versioned tables and replica tables get no
   special rule, and the tool treats their indexes as ordinary table indexes.
@@ -307,13 +319,25 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   then, and the floor measures the instance, not the database. The floor of 14 days is
   borrowed from sp_IndexCleanup and is not measured. A report that runs once a quarter reads its
   index four times a year, and no short floor sees it.
+- The uptime line describes the instance, not the index. The usage counters cannot show when an
+  index was created, so an index added last week on a server that has run for 90 days is reported
+  as having no reads in 90 days of uptime. It has had less time to be read than the line says.
 - Usage counters belong to one instance. On an Always On readable secondary, reads served there
   are not in the primary's export, so an index can look unread when it is used. I found no
   Microsoft page that states this for Always On. It is my reading of how the counters work. Export from every
   replica that serves reads, or treat an unread verdict as unproven.
 - The registry must come from the same database as the index export. A delta table with no
   registry row is protected in a plan and refused (`REFUSED`, exit 1) in an audit. The base-table
-  index it twins is judged alone, which can leave half a pair. A registry row with a blank `table_name` pairs nothing, for the same reason.
+  index it twins is judged alone, which can leave half a pair. A registry row with a blank
+  `table_name` pairs nothing, for the same reason.
+- A registry row with fewer fields than its header, such as `7,gis`, is read with a blank
+  `table_name` instead of being refused, unlike a short row in the index export. A row whose
+  `table_name` is the text `NULL` is read as a table named `NULL`. Both leave the adds table of
+  that registration unpaired, and its index can be planned alone, which leaves half a pair. I
+  expect the registry table to hold neither row, but I did not run the registry query.
+- A nonclustered row with an empty `key_columns` value is read as an index with no keys, and two
+  such rows count as identical. The export query never writes one, but a hand-edited or truncated
+  export is judged without a refusal.
 - Filter text is compared with its white space collapsed. Two filters that differ only in the
   spacing inside a string, such as `[status]='a  b'` and `[status]='a b'`, count as identical.
 - Names are compared with case folded. In a case-sensitive database, two indexes or columns whose
@@ -344,7 +368,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - In an audit, every other statement is skipped without a message. That includes `DROP STATISTICS`
   and `TRUNCATE`. A `CREATE INDEX ... WITH (DROP_EXISTING = ON)` statement is the exception. The
   audit refuses it, because it rewrites an index that a drop may rely on. The merge scripts that
-  sp_IndexCleanup writes are therefore not audited as they stand.
+  sp_IndexCleanup writes are therefore not audited as they stand. Audit only the `DISABLE` and
+  `DROP CONSTRAINT` scripts that sp_IndexCleanup writes, in a file of their own, because its merge
+  scripts are refused whole.
   `ALTER TABLE ... DROP CONSTRAINT` is read as the removal of that constraint's index. A constraint
   that is not an index, such as a foreign key, is refused as not in the index export.
   `ALTER TABLE t DROP COLUMN c, CONSTRAINT k` is not read as a constraint removal. It is skipped
@@ -373,14 +399,22 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the tool reads at most three parts. It is refused only because that pair is not in the export.
   The refusal is right, but the label names the wrong table, such as `[db].[gis].[ix_q]`. Remove
   the server part.
+- A table name with an empty part, such as `gis..t`, is read as table `gis` with no schema. It is
+  refused only because no such table is in the export.
+- A `DROP INDEX` inside an `IF` block, or under any other condition, is read as unconditional.
+  The audit judges it as if it always ran.
+- An unquoted index name that starts with a non-ASCII letter is refused as unreadable. Bracket it
+  in the script.
 - A script that disables an index that an earlier run already disabled is refused as not in the
   index export, because the export query leaves out disabled indexes.
 - End every statement in an audited script with a semicolon. Without one, a statement can pull in
   the words of the next one. `ALTER INDEX ix_q ON gis.parcels REBUILD` followed by
   `DISABLE TRIGGER trg ON DATABASE;` on the next line is read as one statement with a `DISABLE`
   in it, and the run exits 3 as unreadable.
-- The database part of a three-part table name, and any `USE` statement, is ignored. Audit a
-  script only against the export of the database it was written for. An index target with no
+- A `USE` statement is refused. The database part of a three-part table name is ignored, so a
+  multi-database script from sp_IndexCleanup is judged against one database's export, and objects
+  with the same names in another database get that export's verdict. Audit a script only against
+  the export of the database it was written for. An index target with no
   schema (`ON parcels`) is matched to the one schema that holds that table in the export, but SQL
   Server resolves it with the connection's default schema. Write the schema on every statement.
 - When a base-table index and an identical adds-table twin pair up, and a second identical base
@@ -389,17 +423,24 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - The script `--apply` writes always uses `DROP INDEX`, which cannot be undone. Script the
   `CREATE INDEX` statements first if you may want an index back. A line break in an index or table
   name is written out as `\n` in the `--` comment lines. In the `DROP INDEX` line it stays inside
-  the brackets, as T-SQL allows. Read the script before you run it.
+  the brackets, as T-SQL allows, and SSMS and `sqlcmd` read a line of only `GO` inside it as a
+  batch separator, so what follows that line runs. Read the script before you run it.
+- The script names no database, and the export carries no database name, so the script drops from
+  whichever database the connection uses. Run it in the database you exported from. A second
+  database with the same schema, table and index names, such as a test copy, would lose those
+  indexes instead.
+- Index names are printed as they are, so a name with terminal escape codes can redraw the report
+  on screen. Read the report in a file, not only on screen.
 - The script is written as UTF-8 with no byte order mark. SSMS can read a non-ASCII index name as
   ANSI when you open such a file. The tool reads a BOM and UTF-16 on input.
 - The tool reads the whole export into memory. A counter or an uptime of more than 19 digits is
   refused. An audit matches each listed drop against every index, so the time grows with listed
   drops times indexes. I measured it on Windows with Python 3.13, on a synthetic export of five
   indexes per table, three key shapes and a third of the indexes listed. 3000 indexes with 1000
-  drops took 0.1 seconds. 30000 indexes with 10000 drops took 3.5 seconds. The time depends on the
+  drops took 0.2 seconds. 30000 indexes with 10000 drops took 5 seconds. The time depends on the
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
-  square of its length to scan, about 22 seconds here, because each statement looks ahead for its
-  end.
+  square of its length to scan, about 50 seconds here, because each statement looks ahead for its
+  end. These timings come from one Windows machine and vary by about a factor of two.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
   tool cannot detect the cut.

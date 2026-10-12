@@ -78,14 +78,17 @@ UNSEEN_TYPES = ("SPATIAL", "NONCLUSTERED HASH")
 
 # Columns of the delta tables of a traditionally versioned table. Esri's Oracle
 # help documents D<n>_IDX1 over SDE_STATE_ID and SDE_DELETES_ROW_ID, D<n>_PK
-# over DELETED_AT, SDE_DELETES_ROW_ID and SDE_STATE_ID, and an adds-table index
-# over SDE_STATE_ID. Its SQL Server help names no index. This tool assumes the
+# over DELETED_AT, SDE_DELETES_ROW_ID and SDE_STATE_ID, and A<n>_STATE_ID_IX1
+# over SDE_STATE_ID on the adds table. Its keyword table spells the column
+# sde_deleted_at. Its SQL Server help names no index. This tool assumes the
 # same column names there, and protects any index over one of them.
 DELTA_COLUMNS = frozenset(("sde_state_id", "sde_deletes_row_id", "deleted_at"))
 
 # Esri's SDK help says an attribute index on the object id cannot be deleted.
-# It does not document the name. This pattern is a guess at the name; a wrong
-# guess costs nothing, because the ObjectID index is unique and the unique rule
+# Esri's Oracle help names that index R<N>_SDE_ROWID_UK in a table of storage
+# keywords. Its SQL Server help names no index. This pattern is the Oracle name
+# with an optional underscore, so on SQL Server it is a guess. A wrong guess
+# costs nothing, because the ObjectID index is unique and the unique rule
 # below protects it anyway.
 ROWID_INDEX = re.compile(r"^r_?[0-9]+_sde_rowid_uk$", re.I | re.A)
 
@@ -562,6 +565,9 @@ _REWRITE = re.compile(r"\bDROP_EXISTING\s*=\s*ON\b", re.I)
 _DISABLE = re.compile(r"\bDISABLE\b", re.I)
 _DROP_CONSTRAINT = re.compile(r"\bDROP\s+CONSTRAINT\b", re.I)
 _WITH = re.compile(r"\s*WITH\s*\(", re.I)
+# USE at the start of a statement. A script that switches database names objects
+# the export knows nothing about.
+_USE = re.compile(r"(?:^|[;\r\n])\s*(?P<use>USE)\s+\S", re.I)
 
 # One left-to-right scan, so a '--' or '/*' inside a string or a bracketed
 # name is not a comment, and a quote inside a comment is not a string. A lone
@@ -642,6 +648,12 @@ def parse_drops(text):
     scripts for a unique constraint. Other ALTER INDEX statements are not
     removals. DROP TABLE removes every index on the table, so it is refused."""
     clean = strip_comments(text)
+    use = _USE.search(clean)
+    if use:
+        raise Refused("line %d: USE switches database, and the export holds "
+                      "one database. Take it out, then audit the script "
+                      "against the export of the database it runs in."
+                      % (clean.count("\n", 0, use.start("use")) + 1))
     words = list(_WORDS.finditer(clean))
     out = []
     for n, word in enumerate(words):
@@ -1094,6 +1106,9 @@ def self_test():
     check(mk("x", keys="[owner] ASC").signature !=
           mk("x", keys="[owner] DESC").signature,
           "key direction is part of the signature")
+    check(mk("x", keys="[a]+[b]").signature != mk("x", keys="[b]+[a]").signature
+          and mk("x", keys="[a]+[b]").keys == (("a", "ASC"), ("b", "ASC")),
+          "key column order is part of the signature  <-- pinned defect")
     check(mk("x", flt="[a]=1").signature != mk("x").signature,
           "a filter is part of the signature")
 
@@ -1186,8 +1201,22 @@ def self_test():
     check("deletes table" in cls("ix", "d_7")[1] and
           cls("ix", "d_7")[0] == ("gis", "d_7"),
           "a deletes-table index is protected and stays on its own table")
+    check("deletes table" in cls("ix", "D7")[1] and
+          "deletes table" in cls("ix", "D_7")[1] and
+          cls("ix", "D7")[0] == ("gis", "d7"),
+          "the upper-case D7 and D_7 spellings are deletes tables  "
+          "<-- pinned defect")
     check("maintains" in cls("ix", "a_7", keys="[sde_state_id]")[1],
           "an adds-table index on sde_state_id is protected")
+    check("maintains" in cls("ix", "a_7", keys="[sde_deletes_row_id]")[1] and
+          "maintains" in cls("ix", "a_7", keys="[deleted_at]")[1],
+          "an adds-table index on sde_deletes_row_id or deleted_at is "
+          "protected  <-- pinned defect")
+    check("maintains" in cls("ix", "a_7", includes="[sde_state_id]")[1] and
+          cls("ix", "a_7", includes="[other]")[1] is None,
+          "an adds-table index that only includes a maintained column is "
+          "protected, one that includes another column is not  <-- pinned "
+          "defect")
     check("no registry row" in cls("ix", "a_99")[1],
           "a delta-named table with no registry row is protected")
     check("no registry row" in cls("ix", "a_7", schema="other")[1],
@@ -1298,6 +1327,12 @@ def self_test():
     check(classify(mk("ix", keys="[sde_state_id]"), registry)[1] is None,
           "an index over sde_state_id on a base table is judged, only the "
           "delta tables are protected by column")
+    uq_twin = build([mk("ix_z", keys="[zone]"),
+                     mk("ix_z", "a_7", keys="[zone]", unique=True)], registry)
+    check(actions(plan(uq_twin, mid)) == [(KEEP, "ix_z")] and
+          uq_twin.units[0].protected,
+          "a twin pair is protected when only its adds member is  "
+          "<-- pinned defect")
     held = "\n".join(describe_plan(plan(build([mk("ix_a")]), 10)))
     check("HOLD" in held and "1 held for uptime" in held,
           "the plan report shows a held index")
@@ -1374,6 +1409,12 @@ def self_test():
     r14d = audit(pk_twin, [("gis", "parcels", "ix_pk", 1)], mid)
     check(r14d[0][0] == REFUSED and r14d[0][2] == "backs a PRIMARY KEY constraint",
           "a protected twin listed alone is refused for its own rule")
+    r14e = audit(uq_twin, [("gis", "parcels", "ix_z", 1),
+                           ("gis", "a_7", "ix_z", 2)], mid)
+    check([v for v, _, _ in r14e] == [REFUSED, REFUSED] and
+          "is unique" in r14e[0][2] and "is unique" in r14e[1][2],
+          "a base index listed with a unique adds twin is refused on both  "
+          "<-- pinned defect")
     r15, _ = aud([mk("ix_zone", keys="[owner]"),
                   mk("ix_x", "a_7", keys="[zone]")], ["ix_x"],
                  reg=registry, table="a_7")
@@ -1539,6 +1580,43 @@ def self_test():
                                      "DROP INDEX b ON gis.t;\r")] == ["a", "b"],
           "a '--' comment ends at a bare CR, so the DROP after it is read  "
           "<-- pinned defect")
+    check([d[2] for d in parse_drops("DROP  INDEX a ON gis.t;\ndrop\tindex b ON "
+                                     "gis.t;\nDROP\n  INDEX c ON gis.t;")] ==
+          ["a", "b", "c"], "white space of any width between DROP and INDEX "
+          "is read  <-- pinned defect")
+    raises(lambda: parse_drops("drop index a on gis.t with (online = on), b on "
+                               "gis.t;"),
+           "a lower-case with (...) before a second target is refused  "
+           "<-- pinned defect", "several indexes")
+    raises(lambda: parse_drops("DROP INDEX gis.t.b;\nDROP INDEX a ON gis.t;"),
+           "an unreadable DROP INDEX does not borrow the target of the next "
+           "statement  <-- pinned defect", "DROP INDEX name ON")
+    check(parse_drops("ALTER INDEX a ON gis.t REBUILD;\nDISABLE TRIGGER trg ON "
+                      "DATABASE;\nDROP INDEX b ON gis.t;") ==
+          [("gis", "t", "b", 3)],
+          "a semicolon ends an ALTER INDEX statement before a later DISABLE")
+    check(parse_drops("DROP INDEX [a]]b] ON [gis].[t]]u];") ==
+          [("gis", "t]u", "a]b", 1)],
+          "a closing bracket doubled inside a bracketed name is read as one "
+          "bracket")
+    check(parse_drops("DROP INDEX a ON gis . t;\nDROP INDEX b ON x\n.\ny\n.t;") ==
+          [("gis", "t", "a", 1), ("y", "t", "b", 2)],
+          "white space around the dots of a table name is read")
+    check(parse_drops("DROP INDEX a ON srv.db.gis.t;")[0][:3] ==
+          ("db", "gis", "a"),
+          "a four-part table name is read as its first three parts, a "
+          "documented limit")
+    for use in ("USE [Db2];\nDROP INDEX a ON gis.t;",
+                "DROP INDEX a ON gis.t;\r\nuse Db2\r\nDROP INDEX b ON gis.t;",
+                "DROP INDEX a ON gis.t; USE db2; DROP INDEX b ON gis.t;"):
+        raises(lambda: parse_drops(use), "a USE statement is refused, so a "
+               "script for another database is not judged against this export  "
+               "<-- pinned defect", "USE switches database")
+    raises(lambda: parse_drops("DROP INDEX a ON gis.t;\n\n\n  USE db2"),
+           "a USE refusal names its own line", "line 4:")
+    check(parse_drops("DROP INDEX [use x] ON gis.t;\nDROP INDEX user_ix ON "
+                      "gis.t;")[1][2] == "user_ix",
+          "an index name that starts with 'use' is not a USE statement")
     for bad in ("PRINT 'open; DROP INDEX a ON gis.t", "/* open\nDROP INDEX a "
                 "ON gis.t", "DROP INDEX [a ON gis.t", 'DROP INDEX "a ON t'):
         raises(lambda: parse_drops(bad), "a string, name or comment that "
