@@ -652,6 +652,18 @@ _DYNAMIC = re.compile(
 _DYNAMIC_QUOTED = re.compile(
     r'(?<![\w@#$])[\["]SP_(?:EXECUTESQL|PREPARE|PREPEXEC)[\]"](?![\w@#$])',
     re.I)
+# A batch is cut at a line that holds only GO. The first word of a batch that is
+# not one of these starts a call without EXEC. A quoted first name is a call too.
+_GO = re.compile(r"(?:\A|(?<=[\r\n]))[ \t]*GO(?:[ \t]+\d+)?[ \t]*(?=[\r\n]|\Z)",
+                 re.I)
+_FIRST = re.compile(r"\s*([A-Za-z_][\w@#$]*|[\[\"])")
+_STATEMENTS = frozenset("""
+    ADD ALTER BACKUP BEGIN BREAK BULK CHECKPOINT CLOSE COMMIT CONTINUE CREATE
+    DBCC DEALLOCATE DECLARE DELETE DENY DISABLE DROP ENABLE END EXEC EXECUTE
+    FETCH GET GO GOTO GRANT IF INSERT KILL MERGE MOVE OPEN PRINT RAISERROR
+    READTEXT RECEIVE RECONFIGURE RESTORE RETURN REVERT REVOKE ROLLBACK SAVE
+    SELECT SEND SET SETUSER SHUTDOWN THROW TRUNCATE UPDATE UPDATETEXT USE
+    WAITFOR WHILE WITH WRITETEXT""".split())
 _STRING = re.compile(r"'(?:[^']|'')*'")
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\"(?:[^\"]|\"\")*\"")
 _BREAKS = re.compile(r"[;\r\n]")
@@ -826,6 +838,21 @@ def dynamic_lines(text):
                       for m in _DYNAMIC_QUOTED.finditer(quoted)))
 
 
+def bare_call_lines(text):
+    """The line numbers where a batch starts with a name that is no T-SQL
+    statement word. Microsoft makes EXEC optional for the first statement of a
+    batch, so `dbo.cleanup;` after a GO line is a procedure call, and its text is
+    unread. A GO line is the word GO alone on its line, with an optional count."""
+    bare = strip_comments(text)
+    quoted = _STRING.sub(lambda m: blank(m.group()), bare)
+    out = []
+    for start in [0] + [m.end() for m in _GO.finditer(quoted)]:
+        m = _FIRST.match(quoted, start)
+        if m and m.group(1).upper() not in _STATEMENTS:
+            out.append(quoted.count("\n", 0, m.start(1)) + 1)
+    return out
+
+
 def one_line(text):
     """The text with line breaks written out, so a name that holds one cannot
     end a '--' comment and leave the rest of the name as live SQL."""
@@ -977,6 +1004,12 @@ def analyse(index_text, registry_text=None, drops_text=None,
                  "sp_prepare or sp_prepexec runs text this tool cannot read. "
                  "The script may remove an index that was never judged")
                 for n in dynamic_lines(drops_text)]
+    # So is a procedure called without EXEC at the start of a batch.
+    dynamic = set(dynamic_lines(drops_text))
+    results += [(UNPROVEN, "line %d" % n, "a batch starts with a name, not a "
+                 "statement word, so it calls a procedure without EXEC. This "
+                 "tool cannot read what it runs")
+                for n in bare_call_lines(drops_text) if n not in dynamic]
     # An UNPROVEN drop exits 1 too: a gate that reads only the exit code must
     # not pass a drop the rules could not judge.
     code = 1 if any(r[0] != SAFE for r in results) else 0
@@ -2120,6 +2153,47 @@ def self_test():
     check(code == 1 and "UNPROVEN  line 3" in "\n".join(lines),
           "a safe drop plus sys.sp_executesql is not a clean audit  "
           "<-- pinned defect")
+    lines, code, units = analyse(
+        twins, None, "DROP INDEX ix_b ON gis.t;\nGO\ndbo.drop_stale_indexes;")
+    body = "\n".join(lines)
+    check(code == 1 and "UNPROVEN  line 3  a batch starts with a name" in body
+          and "1 of 2 could not be proven safe" in lines[-1],
+          "a procedure called without EXEC after a GO line is not a clean "
+          "audit  <-- pinned defect")
+    lines, code, units = analyse(
+        twins, None, "DROP INDEX ix_b ON gis.t;\r\nGO\r\n"
+        "sp_helpindex 'gis.t';")
+    check(code == 1 and "UNPROVEN  line 3" in "\n".join(lines),
+          "any name that starts a batch is a call, a system procedure too, "
+          "with CRLF line ends  <-- pinned defect")
+    lines, code, units = analyse(twins, None, "[dbo].[drop_stale];\n"
+                                 "DROP INDEX ix_b ON gis.t;")
+    check(code == 1 and "UNPROVEN  line 1" in "\n".join(lines),
+          "a quoted name that starts the script is a call too  "
+          "<-- pinned defect")
+    lines, code, units = analyse(
+        twins, None, "DROP INDEX ix_b ON gis.t;\nGO\nsys.sp_executesql @s;")
+    check("\n".join(lines).count("UNPROVEN  line 3") == 1,
+          "a qualified sp_executesql that starts a batch is reported once")
+    check(bare_call_lines("GO\n;x\nGO 2\r\nGO\n  go  \ndbo.p;\nGO\n") == [6],
+          "GO lines of any case or count cut batches, and an empty batch or "
+          "one that starts with a semicolon holds no call")
+    check(bare_call_lines("PRINT 'x\nGO\ndbo.a'\n/*\nGO\n*/\nDECLARE @n int;\n"
+                          "GO now\nSET NOCOUNT ON;\nGO\nIF 1 = 1 EXEC p;\n"
+                          "GO\nWITH c AS (SELECT 1) SELECT 1;\nGO\nEXEC dbo.p;"
+                          "\nGO\nUPDATE t SET x = 1;") == [],
+          "statement words start a batch, and a GO in a string, a comment or "
+          "with a word after it is no batch end")
+    raises(lambda: bare_call_lines("DROP INDEX x ON t.u;\nGO\n'unclosed"),
+           "a string that never closes is refused", "never closes")
+    nul_name = []
+    with contextlib.suppress(Refused):
+        nul_name.append(read_rows(
+            ",".join(INDEX_COLUMNS) + "\ngis,t,a\x00b,NONCLUSTERED,0,0,0,"
+            "[owner],,,0,0,0,0\n", INDEX_COLUMNS, "x")[0][1]["index_name"])
+    check(nul_name == (["a\x00b"] if sys.version_info >= (3, 11) else []),
+          "a NUL byte in a field is read as it is on Python 3.11 and later, "
+          "and refused as unreadable CSV before")
     raises(lambda: analyse(twins, None, "DROP INDEX ix_b ON gis.t;\n"
                            "DROP DATABASE gis_prod;"),
            "a list with a DROP DATABASE is refused whole  <-- pinned defect",

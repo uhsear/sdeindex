@@ -64,6 +64,10 @@ PASS  a qualified or quoted sp_executesql is dynamic SQL, called without EXEC  <
 PASS  sp_prepexec and sp_prepare run text, so they are dynamic SQL  <-- pinned defect
 PASS  a safe drop plus sp_prepexec is not a clean audit  <-- pinned defect
 ...
+PASS  a procedure called without EXEC after a GO line is not a clean audit  <-- pinned defect
+PASS  any name that starts a batch is a call, a system procedure too, with CRLF line ends  <-- pinned defect
+PASS  a quoted name that starts the script is a call too  <-- pinned defect
+...
 PASS  a list with a DROP DATABASE is refused whole  <-- pinned defect (message names 'DROP DATABASE removes every index it holds')
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
@@ -77,7 +81,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-316 assertions, 0 failed
+324 assertions, 0 failed
 ```
 
 ## What already exists
@@ -119,13 +123,14 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 316 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
+The self-test prints the same 324 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
 (Python 3.12.3). The three outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
-Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 316
-assertions, with a pure-Python copy of `coverage` placed beside the script and nothing installed
-on the host. I did not measure coverage on Python 3.9.
+Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 324
+assertions, with `coverage` 7.17.0 in a virtual environment outside the checkout. I did not
+measure coverage on Python 3.9 or 3.10. The self-test also passes, with 324 assertions, on Python
+3.10.20 and 3.12 on Windows.
 
 ```
 git clone https://github.com/uhsear/sdeindex.git
@@ -317,7 +322,7 @@ Microsoft adds a row for an index on its first use, so a blank counter reads as 
 
 | Code | Meaning |
 |---|---|
-| 0 | A plan, or an audit in which every listed drop is `SAFE`. |
+| 0 | A plan, or an audit in which every listed drop is `SAFE`. A plan exits 0 even when it holds every unread index for uptime, or when the export has no `uptime_hours` column. Nothing is called safe then, and the verdict line says `held for uptime`. Read that line: exit 0 from a plan means the run finished, not that a drop is ready. |
 | 1 | The audited script holds a removal the rules refuse (`REFUSED`) or cannot prove (`UNPROVEN`). Do not run it as it stands. |
 | 2 | A file could not be read, or `--out` could not be written or already exists. Also an unexpected Python error, which prints its traceback, and a closed output pipe. |
 | 3 | The input was refused. Nothing was judged and nothing was written. |
@@ -440,7 +445,11 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   because the text it runs is not read. A schema or database name before the procedure, such as
   `sys.sp_executesql`, and a quoted name, such as `[sys].[sp_executesql]`, count too. Microsoft
   allows a procedure call without `EXEC` as the first statement of a batch, so these forms are
-  legal. [sp_prepare](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepare-transact-sql)
+  legal. The audit also reads any batch that starts with a name that is not a T-SQL statement
+  word, such as `dbo.drop_stale_indexes;` or `sp_helpindex 'gis.t';` after a `GO` line, as such a
+  call. It reports an `UNPROVEN` line and exits 1. A batch ends at a line that holds only `GO`,
+  with an optional count. A label, such as `done:`, starts a batch with a name too, so it exits 1.
+  Before this rule, the script `DROP INDEX ... ;`, `GO`, `dbo.drop_stale_indexes;` exited 0. [sp_prepare](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepare-transact-sql)
   prepares a statement for a later `sp_execute`, and
   [sp_prepexec](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepexec-transact-sql)
   prepares and runs it. Before this rule, a script that built a removal as text and ran it with
@@ -539,7 +548,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - Spaces at the start or end of an index or table name are stripped when the CSV is read, so a
   script written for such a name would name a different index. A NUL byte in a field is read as it
   is and printed unchanged on Python 3.11 and later. On Python 3.9 and 3.10 the `csv` module
-  raises "line contains NUL", and the run exits 3 as not readable CSV. A name that differs from
+  raises "line contains NUL", and the run exits 3 as not readable CSV. The self-test checks
+  this on the Python that runs it. A name that differs from
   SQL Server's only by Unicode normalisation is read as it is.
 - A `--` comment ends at a CR or an LF, so a script with bare CR line endings reads correctly.
   Line numbers in messages count LF only, so such a script reports every line as line 1.
@@ -614,9 +624,15 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - The audit reads plain T-SQL only. A SQLCMD directive such as `:r other.sql`, `:connect` or `!!`
   is ignored, so a removal in an included file is not seen and the audit can exit 0. Audit a
   script that has none of them.
-- Only `EXEC`, `EXECUTE`, `sp_executesql`, `sp_prepare` and `sp_prepexec` mark a script as holding
-  text the tool cannot read. A bare call of another procedure that removes indexes, such as `sp_MSforeachtable` with a
-  removal in its argument, or `xp_cmdshell`, is not detected, and the audit can exit 0.
+- A call that has no `EXEC` can only be the first statement of a batch, and the audit marks that
+  form. Any other procedure that removes indexes is marked only when `EXEC` or `EXECUTE` calls it.
+  A removal in the argument of `sp_MSforeachtable`, or a call of `xp_cmdshell`, inside a batch is
+  marked by its `EXEC`. A removal that runs through a linked server, a job or a SQLCMD
+  directive is not seen, and the audit can exit 0.
+- A word in the batch-start list that is also the name of a procedure, such as a procedure named
+  `Set` called without `EXEC`, is read as a statement word and not marked. The list holds the
+  T-SQL statement words I know. A new statement word that it lacks exits 1, which errs on the
+  safe side.
 - The script `--apply` writes always uses `DROP INDEX`, even when the audited statement was an
   `ALTER INDEX ... DISABLE`, which `REBUILD` undoes. Rewrite it as `DISABLE` yourself if you want
   the reversible step.
@@ -625,6 +641,13 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   of listed drops can take minutes.
 - The tool writes no CSV. A report that you paste into a spreadsheet is not guarded against cells
   that start with `=`, `+`, `-` or `@`.
+- sp_IndexCleanup 2.11 also measures usage age per database, which this tool does not. It skips the unused-index rule for a database with 7 days or less of data. This tool measures the instance only.
+- A bare word `sp_executesql` used as a column alias, such as `SELECT 1 AS sp_executesql`, is read as dynamic SQL. It gives an `UNPROVEN` line and exit 1, which errs on the safe side.
+- `ALTER TABLE ... DROP CONSTRAINT a, b`, a list that Microsoft allows, is refused whole with exit 3, and the message says `several indexes`. Write one statement per constraint.
+- The description of dbatools `Find-DbaDbUnusedIndex` above is partial. The command also checks for a recent restart with the tempdb create date, and it has a further 33-day condition. I cite only the 6-day stop.
+- The audit reads statements one at a time, not in order. A `DISABLE` that a later `REBUILD` undoes, or a `DROP` that a later `CREATE` replaces, is still read as a removal.
+- A traceback from an unexpected error shows full file paths. Check it for private names before you paste it into a ticket.
+- A refusal quotes the whole value it refused, which can be very long in a damaged file.
 - A failed `--self-test` exits 1, the code an audit also uses for findings. A gate cannot tell a
   broken tool from a refused list. Read the last line of the output.
 - On Linux, a Windows path passed to `--drops`, such as `C:\dir\file.sql`, is copied whole into the
