@@ -381,7 +381,8 @@ def classify(ix, registry):
             ix, "is on %s, the deletes table of %s, which the geodatabase "
                 "maintains" % (ix.table, entry[1]))
     if ix.columns & DELTA_COLUMNS:
-        return home, protection(
+        # Its base-table twin must pair with it, or the pair splits.
+        return entry, protection(
             ix, "is on %s, the adds table of %s, and indexes a column the "
                 "geodatabase maintains" % (ix.table, entry[1]))
     return entry, protection(ix)
@@ -1322,6 +1323,15 @@ def self_test():
           "an adds-table index that only includes a maintained column is "
           "protected, one that includes another column is not  <-- pinned "
           "defect")
+    half = build([mk("ix_del", keys="[deleted_at]"),
+                  mk("ix_del", "a_7", keys="[deleted_at]")], registry)
+    check(len(half.units) == 1 and half.units[0].protected and
+          actions(plan(half, mid)) == [(KEEP, "ix_del")],
+          "a base index on deleted_at pairs with its protected adds twin, "
+          "so the plan keeps both  <-- pinned defect")
+    check(audit(half, [("gis", "parcels", "ix_del", 1)], mid)[0][0] == REFUSED,
+          "an audit that drops only the base copy of a protected pair is "
+          "refused  <-- pinned defect")
     check("no registry row" in cls("ix", "a_99")[1],
           "a delta-named table with no registry row is protected")
     check("no registry row" in cls("ix", "a_7", schema="other")[1],
