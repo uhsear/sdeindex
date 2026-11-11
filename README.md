@@ -38,7 +38,9 @@ PASS  a base index listed without its adds twin is refused  <-- pinned defect
 ...
 PASS  a second index after a WITH clause is refused, not skipped  <-- pinned defect (message names 'several indexes')
 ...
-PASS  ALTER TABLE ... DROP CONSTRAINT is read as a removal, as sp_IndexCleanup scripts it  <-- pinned defect
+PASS  alter table ... drop constraint is read as a removal, as sp_IndexCleanup scripts it  <-- pinned defect
+...
+PASS  a constraint drop with no CONSTRAINT keyword is read as a removal  <-- pinned defect
 ...
 PASS  a '--' inside a string does not hide the DROP after it  <-- pinned defect
 ...
@@ -54,8 +56,12 @@ PASS  --out without --apply writes nothing  <-- pinned defect
 ...
 PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned defect
 ...
+PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
+...
+PASS  a column drop that goes on with a constraint is refused, not skipped  <-- pinned defect (message names 'ALTER TABLE schema.table DROP CONSTRAINT name')
+...
 --------------------------------------------------------------------
-254 assertions, 0 failed
+282 assertions, 0 failed
 ```
 
 ## What already exists
@@ -85,21 +91,22 @@ keeper, and no tool above checks it.
 This tool adds two things. It knows the geodatabase rules. And its audit mode reads any script of
 `DROP INDEX`, `ALTER INDEX ... DISABLE` or `ALTER TABLE ... DROP CONSTRAINT` statements, including
 the `DISABLE` and `DROP CONSTRAINT` scripts that sp_IndexCleanup writes, and judges the whole
-script against the export. A name search of
-GitHub for `sdeindex` found no other repository on 2026-10-12.
+script against the export. A repository search of
+GitHub for `sdeindex` returned only this repository on 2026-11-10.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 The tool reads an index CSV, an optional registry CSV and, in audit mode, one script. It writes
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
-removes, and starts one child Python process.
+removes, and starts two child Python processes.
 
-The self-test prints the same 254 assertions on Windows (Python 3.13.2), on Windows with Python
+The self-test prints the same 282 assertions on Windows (Python 3.13.2), on Windows with Python
 3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
-`coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches. I
-measured coverage on Windows with Python 3.13.2 only, not on Python 3.9 or Linux.
+`coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
+Windows with Python 3.13.2 and on Ubuntu with Python 3.12.3. I did not measure coverage on
+Python 3.9.
 
 ```
 git clone https://github.com/uhsear/sdeindex.git
@@ -238,16 +245,32 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 |---|---|
 | `DROP INDEX name ON schema.table` | A removal. `IF EXISTS` and a `WITH (...)` clause are read past. |
 | `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index. |
-| `ALTER TABLE schema.table DROP CONSTRAINT name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. |
+| `ALTER TABLE schema.table DROP [CONSTRAINT] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too. |
+| `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
 | `USE database` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. |
 | `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
-| Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements | Not removals. Skipped. |
+| Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements, including `DROP COLUMN`, `DROP PERIOD` and `ALTER COLUMN ... DROP SPARSE` | Not removals. Skipped. |
 
 A statement with several targets, such as `DROP INDEX a ON t, b ON t`, is refused with exit 3. So is
 `ALTER INDEX ALL`. Comments are ignored. A `--` or `/*` inside a string or a bracketed name does
 not start a comment, and block comments nest as T-SQL nests them. A string, quoted name or
-comment that never closes is refused.
+comment that never closes is refused. A `;` or a line break inside a string or a quoted name does
+not end or start a statement.
+
+Microsoft documents the syntax this table relies on:
+[DROP INDEX](https://learn.microsoft.com/en-us/sql/t-sql/statements/drop-index-transact-sql)
+(`IF EXISTS`, a comma-separated list of `index ON table`, a `WITH` clause, the old
+`table.index` form kept for backward compatibility, and no `DROP INDEX` for the index of a
+`PRIMARY KEY` or `UNIQUE` constraint),
+[ALTER INDEX](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-index-transact-sql)
+(`DISABLE`, and `ALL` in place of a name),
+[ALTER TABLE](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql)
+(an optional `CONSTRAINT`, a list of constraints, the required `COLUMN`, and the `ALTER COLUMN`
+forms `DROP ROWGUIDCOL`, `PERSISTED`, `NOT FOR REPLICATION`, `SPARSE`, `HIDDEN` and `MASKED`) and
+[block comments](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/slash-star-comment-transact-sql)
+(they nest). I read these pages on 2026-11-10. The self-test checks how this tool reads each
+form, not what SQL Server does with it.
 
 ## The rules
 
@@ -275,7 +298,7 @@ Microsoft adds a row for an index on its first use, so a blank counter reads as 
 |---|---|
 | 0 | A plan, or an audit in which every listed drop is `SAFE`. |
 | 1 | The audited script holds a removal the rules refuse (`REFUSED`) or cannot prove (`UNPROVEN`). Do not run it as it stands. |
-| 2 | A file could not be read, or `--out` could not be written or already exists. |
+| 2 | A file could not be read, or `--out` could not be written or already exists. Also an unexpected Python error, which prints its traceback, and a closed output pipe. |
 | 3 | The input was refused. Nothing was judged and nothing was written. |
 | 64 | Usage error, including an unknown or abbreviated flag. |
 
@@ -373,18 +396,17 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   scripts are refused whole.
   `ALTER TABLE ... DROP CONSTRAINT` is read as the removal of that constraint's index. A constraint
   that is not an index, such as a foreign key, is refused as not in the index export.
-  `ALTER TABLE t DROP COLUMN c, CONSTRAINT k` is not read as a constraint removal. It is skipped
-  silently next to other statements, and exits 3 as "no DROP statement" if it is the only one.
-  `ALTER TABLE t DROP uq_x`, with the `CONSTRAINT` keyword left out, is valid T-SQL
-  ([Microsoft, ALTER TABLE](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql)
-  makes the keyword optional). The audit does not read it as a removal, and it is skipped in the
-  same way.
+  The name in a constraint drop is looked up among the indexes of that table, so a foreign key,
+  check or default constraint with the same name as a plain index on that table is judged as that
+  index. `ALTER TABLE gis.parcels DROP CONSTRAINT ix_a` exits 0 with `SAFE` when `ix_a` is an
+  unread plain index with an identical copy. SQL Server would drop the other constraint, or fail.
+  Do not give a constraint the name of an index on its table.
 - `CREATE SPATIAL INDEX`, `CREATE XML INDEX` and `CREATE NONCLUSTERED HASH INDEX` with
   `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
   index that the tool judges can be rewritten by those forms, so no verdict changes.
 - An exit 0 from an audit means that every removal the tool could read is safe. It does not mean
-  the script is safe. A removal that the tool skips, such as `ALTER TABLE ... DROP COLUMN c,
-  CONSTRAINT k` or `ALTER TABLE t DROP uq_x`, can sit in a script that exits 0.
+  the script is safe. A removal that the tool skips, such as one inside dynamic SQL, can sit in
+  a script that exits 0.
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
 - Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
@@ -392,13 +414,11 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - A `DROP INDEX`, `ALTER INDEX ... DISABLE` or `DROP CONSTRAINT` phrase inside a string, such as
   `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
   `UNPROVEN`, and `--apply` can write a drop the author did not list.
-- Do not put a semicolon inside an index, table or constraint name. An `ALTER` statement with one
-  is skipped without a message, so `ALTER INDEX [ix_a;b] ON gis.parcels DISABLE;` next to a safe
-  `DROP INDEX` can exit 0 with that removal unjudged.
 - A four-part table name (server.db.schema.table) is split as schema `db` and table `gis`, because
   the tool reads at most three parts. It is refused only because that pair is not in the export.
   The refusal is right, but the label names the wrong table, such as `[db].[gis].[ix_q]`. Remove
-  the server part.
+  the server part. In `ALTER TABLE srv.db.gis.t DROP uq_x` the four-part name is refused as
+  unreadable, with exit 3.
 - A table name with an empty part, such as `gis..t`, is read as table `gis` with no schema. It is
   refused only because no such table is in the export.
 - A `DROP INDEX` inside an `IF` block, or under any other condition, is read as unconditional.
@@ -437,9 +457,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   refused. An audit matches each listed drop against every index, so the time grows with listed
   drops times indexes. I measured it on Windows with Python 3.13, on a synthetic export of five
   indexes per table, three key shapes and a third of the indexes listed. 3000 indexes with 1000
-  drops took 0.2 seconds. 30000 indexes with 10000 drops took 5 seconds. The time depends on the
+  drops took 0.2 seconds. 30000 indexes with 10000 drops took 4 seconds. The time depends on the
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
-  square of its length to scan, about 50 seconds here, because each statement looks ahead for its
+  square of its length to scan, about 45 seconds here, because each statement looks ahead for its
   end. These timings come from one Windows machine and vary by about a factor of two.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
@@ -457,11 +477,13 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   Line numbers in messages count LF only, so such a script reports every line as line 1.
 - Only CR and LF are written out as `\r` and `\n` in the `--` comment lines of the script. Other
   Unicode line separators in a name are written as they are.
-- Any uncaught Python error ends the run with a traceback and exit 1, which is also the code of a
-  refused audit. A gate that reads only the exit code cannot tell a crash from findings. Two known
-  causes: a file name that is not valid UTF-8, which can also leave an empty `--out` file, and a
-  closed output pipe, such as `python sdeindex.py big.csv | head -1`, which fails in the first
-  `print` (an `OSError` on Windows).
+- An unexpected Python error ends the run with a traceback and exit 2, not the 1 of a refused
+  audit, so a gate that reads the exit code can tell a crash from findings. Known causes: a file
+  name that is not valid UTF-8 (seen on Linux), which can also leave an empty `--out` file, and a
+  closed output pipe. A closed pipe is reported as `error: ...` and exits 2 when the reader has
+  gone before the report is written, such as `python sdeindex.py big.csv | head -1` on a report
+  longer than the pipe buffer. A short report fits the buffer, `head` reads it all and the run
+  exits 0.
 - A run that exits 3 writes nothing. A run without `--apply` writes nothing. An audit that exits 1
   still writes the `SAFE` drops when you pass `--apply`. After an exit 2 from `--apply`, delete a
   partial `--out` file before you retry. On Windows, `--out NUL --apply` prints a "Wrote" line
@@ -469,7 +491,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   removes.
 - It opens no socket, imports no network module and reads no password or token. The normal plan
   and audit paths read no environment variable. Only `--self-test` touches the environment: it
-  copies it into its one child Python process, which prints none of it. The self-test reads its
+  copies it into one of its two child Python processes, which prints none of it. The self-test reads its
   own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
 
