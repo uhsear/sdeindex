@@ -13,9 +13,9 @@ copy on the adds table as the twin and moves the pair together.
 
 This tool reads an exported index list and the geodatabase table registry, and
 applies those rules. Without --drops it plans its own cleanup. With --drops it
-audits somebody else's script of DROP INDEX or ALTER INDEX ... DISABLE
-statements, the second being the form sp_IndexCleanup writes, and refuses every
-removal the rules forbid.
+audits somebody else's script of DROP INDEX, ALTER INDEX ... DISABLE or
+ALTER TABLE ... DROP [CONSTRAINT] statements, the last two being forms
+sp_IndexCleanup writes, and refuses every removal the rules forbid.
 
     python sdeindex.py --self-test
     python sdeindex.py --print-query
@@ -28,7 +28,7 @@ Nothing is written without --apply, and nothing is ever run against a server.
 --apply writes a DROP INDEX script for a human to read and run. It refuses to
 overwrite a file that exists.
 
-Exit codes: 0 every listed drop is safe or no drop is listed, 1 the audited list
+Exit codes: 0 a plan, or an audit in which every listed drop is safe, 1 the audited list
 holds a drop the rules refuse or cannot prove, 2 a file could not be read or
 written or the tool failed unexpectedly, 3 the input was refused, 64 usage
 error.
@@ -253,13 +253,28 @@ class Index(object):
         return set(k for k, _ in self.keys) | set(self.includes)
 
 
+class Entry(tuple):
+    """One listed drop: (schema, table, name, line). `constraint` is True when
+    the statement was ALTER TABLE ... DROP, which removes constraints only."""
+
+    def __new__(cls, schema, table, name, line, constraint=False):
+        self = tuple.__new__(cls, (schema, table, name, line))
+        self.constraint = constraint
+        return self
+
+
+def ragged(row):
+    """Raises Refused when a CSV row has more or fewer fields than its header."""
+    if None in row or None in row.values():
+        raise Refused("the row has %s fields than the header. A value "
+                      "with an unquoted comma splits a row in two."
+                      % ("more" if None in row else "fewer"))
+
+
 def index_from_row(row, line):
     """One export row as an Index. Raises Refused on a value it cannot read."""
     try:
-        if None in row or None in row.values():
-            raise Refused("the row has %s fields than the header. A value "
-                          "with an unquoted comma splits a row in two."
-                          % ("more" if None in row else "fewer"))
+        ragged(row)
         return Index(
             row["schema_name"].strip(), row["table_name"].strip(),
             row["index_name"].strip(), row["type_desc"],
@@ -297,15 +312,19 @@ def registry_from_rows(pairs):
     to lower case."""
     registry = {}
     for line, row in pairs:
-        rid = (row["registration_id"] or "").strip()
+        try:
+            ragged(row)
+        except Refused as exc:
+            raise Refused("registry line %d: %s" % (line, exc))
+        rid = row["registration_id"].strip()
         if not whole(rid):
             raise Refused("registry line %d: registration_id is %r"
                           % (line, rid))
         if int(rid) in registry:
             raise Refused("registry line %d: registration_id %s is listed "
                           "twice" % (line, rid))
-        registry[int(rid)] = ((row["owner"] or "").strip().lower(),
-                              (row["table_name"] or "").strip().lower())
+        registry[int(rid)] = (row["owner"].strip().lower(),
+                              row["table_name"].strip().lower())
     return registry
 
 
@@ -485,12 +504,20 @@ def audit(model, entries, uptime, min_days=DEFAULT_MIN_UPTIME_DAYS):
     """[(verdict, label, reason)] for each listed (schema, table, index, line)."""
     found = {}
     listed = set()
-    for entry in entries:
+    plain = {}
+    for n, entry in enumerate(entries):
         schema, table, name, line = entry
         hits = model.find(schema, table, name)
-        if len(hits) == 1:
-            found[entry] = hits[0]
-            listed.add(hits[0].key)
+        if len(hits) != 1:
+            continue
+        # ALTER TABLE ... DROP removes constraints only. An index with no
+        # constraint behind it is not what the statement drops.
+        if (getattr(entry, "constraint", False)
+                and not (hits[0].pk or hits[0].uc)):
+            plain[n] = hits[0]
+            continue
+        found[entry] = hits[0]
+        listed.add(hits[0].key)
     verdict = {}
     candidates = []
     for unit in model.units:
@@ -534,8 +561,15 @@ def audit(model, entries, uptime, min_days=DEFAULT_MIN_UPTIME_DAYS):
                 verdict[m.key] = (SAFE, "identical to %s, which stays"
                                   % stays[0].members[0].label)
     out = []
-    for entry in entries:
+    for n, entry in enumerate(entries):
         schema, table, name, line = entry
+        if n in plain:
+            out.append((UNPROVEN, "line %d: ALTER TABLE ... DROP removes a "
+                        "constraint, and %s has no constraint behind it. The "
+                        "statement does not drop this index, so the export "
+                        "cannot show what it drops" % (line, bracket(name)),
+                        plain[n].label))
+            continue
         if entry in found:
             ix = found[entry]
             out.append(verdict[ix.key] + (ix.label,))
@@ -737,7 +771,8 @@ def parse_drops(text):
                           "per index." % line)
         parts = [unquote(p) for p in re.findall(_NAME, m.group("table"))]
         schema = parts[-2] if len(parts) > 1 else None
-        out.append((schema, parts[-1], unquote(m.group("name")), line))
+        out.append(Entry(schema, parts[-1], unquote(m.group("name")), line,
+                         kind == "ALTER TABLE"))
     if not out:
         raise Refused("the list holds no DROP INDEX, ALTER INDEX ... "
                       "DISABLE or DROP CONSTRAINT statement. Is it the right "
@@ -1205,9 +1240,19 @@ def self_test():
     row7 = {"registration_id": "7", "owner": "gis", "table_name": "p"}
     raises(lambda: registry_from_rows([(2, row7), (3, row7)]),
            "a registration id listed twice is refused", "listed twice")
-    check(registry_from_rows([(2, {"registration_id": "7", "owner": None,
-                                   "table_name": None})]) == {7: ("", "")},
+    check(registry_from_rows([(2, {"registration_id": "7", "owner": "",
+                                   "table_name": ""})]) == {7: ("", "")},
           "a blank registry owner and table read as empty")
+    raises(lambda: registry_from_rows([(3, {"registration_id": "7",
+                                            "owner": "gis",
+                                            "table_name": None})]),
+           "a registry row with fewer fields than its header is refused  "
+           "<-- pinned defect", "registry line 3: the row has fewer fields")
+    raises(lambda: registry_from_rows([(3, {"registration_id": "7",
+                                            "owner": "gis",
+                                            "table_name": "p", None: ["x"]})]),
+           "a registry row with more fields than its header is refused",
+           "registry line 3: the row has more fields")
 
     # ---- protections
     def why(**kw):
@@ -1563,7 +1608,7 @@ def self_test():
           "alter table ... drop constraint is read as a removal, as "
           "sp_IndexCleanup scripts it  <-- pinned defect")
     check(parse_drops("alter table gis.t drop constraint if exists uq_x")[0] ==
-          ("gis", "t", "uq_x", 1), "IF EXISTS and lower case are read on a "
+          ("gis", "t", "uq_x", 1), "if exists and lower case are read on a "
           "constraint drop")
     raises(lambda: parse_drops("ALTER TABLE gis.t DROP CONSTRAINT a, b;"),
            "a constraint drop naming two constraints is refused",
@@ -1891,6 +1936,32 @@ def self_test():
           "UNIQUE constraint" in "\n".join(lines),
           "a keyword-less constraint drop next to another drop is refused, "
           "not skipped into a clean exit  <-- pinned defect")
+    twins = export([xrow("t", "ix_a", keys="[c1] ASC"),
+                    xrow("t", "ix_b", keys="[c1] ASC")], "9000")
+    lines, code, units = analyse(twins, None, "DROP INDEX ix_a ON gis.t;")
+    check(code == 0 and len(units) == 1,
+          "a plain DROP INDEX of one unread twin is safe")
+    lines, code, units = analyse(twins, None,
+                                 "ALTER TABLE gis.t DROP CONSTRAINT ix_a;")
+    check(code == 1 and units == [] and "UNPROVEN  [gis].[t].[ix_a]  line 1: "
+          "ALTER TABLE ... DROP removes a constraint" in "\n".join(lines),
+          "an alter table ... drop constraint naming a plain index is unproven, "
+          "not judged as a drop of that index  <-- pinned defect")
+    lines, code, units = analyse(twins, None,
+                                 "ALTER TABLE gis.t DROP ix_a;")
+    check(code == 1 and units == [],
+          "a keyword-less alter table ... drop naming a plain index is "
+          "unproven too  <-- pinned defect")
+    lines, code, units = analyse(twins, None, "DROP INDEX ix_a ON gis.t; "
+                                 "ALTER TABLE gis.t DROP CONSTRAINT ix_a;")
+    check(code == 1 and len(units) == 1 and
+          [l.split()[0] for l in lines if l.split()[:1] in (["SAFE"],
+           ["UNPROVEN"])] == ["SAFE", "UNPROVEN"],
+          "a DROP INDEX and an ALTER TABLE drop of one name on one line are "
+          "judged apart  <-- pinned defect")
+    check([e.constraint for e in parse_drops(
+        "DROP INDEX a ON gis.t; ALTER TABLE gis.t DROP b;")] == [False, True],
+          "a listed drop records whether ALTER TABLE named it")
     lines, code, units = analyse(cons, None, "DROP INDEX ix_x ON gis.parcels;")
     check(code == 1 and units == [] and "could not be proven safe" in
           lines[-1],
@@ -1910,6 +1981,10 @@ def self_test():
            "refused", "no table_name")
     raises(lambda: analyse(story, "registration_id\n7\n"), "a registry "
            "missing columns is refused", "the registry export has no")
+    raises(lambda: analyse(story, "registration_id,owner,table_name\n7,gis\n",
+                           "DROP INDEX ix_zone ON gis.parcels;"),
+           "a short registry row is refused, not read as half a pair  "
+           "<-- pinned defect", "registry line 2: the row has fewer fields")
     plain = export([xrow("parcels", "ix_a")])
     check(analyse(plain)[0][0].startswith("uptime: not in the export"),
           "an export with no uptime column says so")

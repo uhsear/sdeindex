@@ -30,6 +30,8 @@ PASS  a column list reads its order and folds case
 ...
 PASS  a superscript digit is refused, not a crash  <-- pinned defect
 ...
+PASS  a registry row with fewer fields than its header is refused  <-- pinned defect (message names 'registry line 3: the row has fewer fields')
+...
 PASS  of two identical unread indexes the plan keeps one for review and drops the other  <-- pinned defect
 ...
 PASS  a list that drops both of an identical pair is REFUSED on one of them  <-- pinned defect
@@ -40,17 +42,24 @@ PASS  a second index after a WITH clause is refused, not skipped  <-- pinned def
 ...
 PASS  alter table ... drop constraint is read as a removal, as sp_IndexCleanup scripts it  <-- pinned defect
 ...
-PASS  a constraint drop with no CONSTRAINT keyword is read as a removal  <-- pinned defect
-...
 PASS  a '--' inside a string does not hide the DROP after it  <-- pinned defect
 ...
 PASS  a '--' comment ends at a bare CR, so the DROP after it is read  <-- pinned defect
 ...
 PASS  a USE statement is refused, so a script for another database is not judged against this export  <-- pinned defect (message names 'USE switches database')
 ...
+PASS  a constraint drop with no CONSTRAINT keyword is read as a removal  <-- pinned defect
+...
+PASS  a column drop that goes on with a constraint is refused, not skipped  <-- pinned defect (message names 'ALTER TABLE schema.table DROP CONSTRAINT name')
+...
+PASS  an alter table ... drop constraint naming a plain index is unproven, not judged as a drop of that index  <-- pinned defect
+PASS  a keyword-less alter table ... drop naming a plain index is unproven too  <-- pinned defect
+...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
+...
+PASS  a short registry row is refused, not read as half a pair  <-- pinned defect (message names 'registry line 2: the row has fewer fields')
 ...
 PASS  --out without --apply writes nothing  <-- pinned defect
 ...
@@ -58,10 +67,8 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 ...
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
-PASS  a column drop that goes on with a constraint is refused, not skipped  <-- pinned defect (message names 'ALTER TABLE schema.table DROP CONSTRAINT name')
-...
 --------------------------------------------------------------------
-282 assertions, 0 failed
+290 assertions, 0 failed
 ```
 
 ## What already exists
@@ -101,7 +108,7 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 282 assertions on Windows (Python 3.13.2), on Windows with Python
+The self-test prints the same 290 assertions on Windows (Python 3.13.2), on Windows with Python
 3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
@@ -245,7 +252,7 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 |---|---|
 | `DROP INDEX name ON schema.table` | A removal. `IF EXISTS` and a `WITH (...)` clause are read past. |
 | `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index. |
-| `ALTER TABLE schema.table DROP [CONSTRAINT] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too. |
+| `ALTER TABLE schema.table DROP [CONSTRAINT] [IF EXISTS] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too, and `IF EXISTS` is read past. If `name` is an index with no primary key or unique constraint behind it, the statement cannot drop that index, and the verdict is `UNPROVEN`. |
 | `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
 | `USE database` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. |
@@ -353,11 +360,11 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   registry row is protected in a plan and refused (`REFUSED`, exit 1) in an audit. The base-table
   index it twins is judged alone, which can leave half a pair. A registry row with a blank
   `table_name` pairs nothing, for the same reason.
-- A registry row with fewer fields than its header, such as `7,gis`, is read with a blank
-  `table_name` instead of being refused, unlike a short row in the index export. A row whose
-  `table_name` is the text `NULL` is read as a table named `NULL`. Both leave the adds table of
-  that registration unpaired, and its index can be planned alone, which leaves half a pair. I
-  expect the registry table to hold neither row, but I did not run the registry query.
+- A registry row with more or fewer fields than its header, such as `7,gis`, is refused, as a short
+  row in the index export is. A row whose `table_name` is the text `NULL` is read as a table named
+  `NULL`. That leaves the adds table of that registration unpaired, and its index can be planned
+  alone, which leaves half a pair. I expect the registry table to hold no such row, but I did not
+  run the registry query.
 - A nonclustered row with an empty `key_columns` value is read as an index with no keys, and two
   such rows count as identical. The export query never writes one, but a hand-edited or truncated
   export is judged without a refusal.
@@ -396,11 +403,12 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   scripts are refused whole.
   `ALTER TABLE ... DROP CONSTRAINT` is read as the removal of that constraint's index. A constraint
   that is not an index, such as a foreign key, is refused as not in the index export.
-  The name in a constraint drop is looked up among the indexes of that table, so a foreign key,
-  check or default constraint with the same name as a plain index on that table is judged as that
-  index. `ALTER TABLE gis.parcels DROP CONSTRAINT ix_a` exits 0 with `SAFE` when `ix_a` is an
-  unread plain index with an identical copy. SQL Server would drop the other constraint, or fail.
-  Do not give a constraint the name of an index on its table.
+  The name in a constraint drop is looked up among the indexes of that table. When it matches an
+  index that has no primary key or unique constraint behind it, the verdict is `UNPROVEN` and the
+  run exits 1, because the statement drops a constraint and the export lists no constraint names.
+  A foreign key, check or default constraint that shares its name with a unique-constraint index
+  or primary key on the same table is still judged as that index, and the tool cannot tell the
+  two apart. Do not give a constraint the name of an index on its table.
 - `CREATE SPATIAL INDEX`, `CREATE XML INDEX` and `CREATE NONCLUSTERED HASH INDEX` with
   `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
   index that the tool judges can be rewritten by those forms, so no verdict changes.
@@ -410,7 +418,19 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
 - Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
-  read. A removal built by joining string pieces inside `EXEC` is not seen.
+  read. A removal built by joining string pieces inside `EXEC` is not seen, and neither is one
+  written as split tokens, such as `'DROP ' + 'INDEX'`.
+- The version numbers of sp_IndexCleanup and sp_BlitzIndex are those I read on 2026-10-12. Later
+  releases may differ.
+- `--out` takes any path you can write, including one outside the working folder. `--apply`
+  creates it without asking, and only an existing file is protected.
+- Error messages print the file paths you passed, and a refusal quotes the offending CSV value.
+  Check both for private names before you paste a run into a ticket.
+- A `SAFE` reason can name a copy that the same list also refuses. With a list that drops both
+  `ix_owner_1` and `ix_owner_2`, the refused one is named as the copy that stays. The script that
+  `--apply` writes holds only `SAFE` units, so it stays safe. The wording is the defect.
+- A closed output pipe during `--self-test`, such as `python sdeindex.py --self-test | head -1`,
+  exits 2 with `error: ...`, as it does for a plan or an audit.
 - A `DROP INDEX`, `ALTER INDEX ... DISABLE` or `DROP CONSTRAINT` phrase inside a string, such as
   `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
   `UNPROVEN`, and `--apply` can write a drop the author did not list.
