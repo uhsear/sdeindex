@@ -86,7 +86,7 @@ holds none of their code.
 - [sp_BlitzIndex](https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit) (version 8.34,
   July 2026) diagnoses a whole database. It reads the server start time, so it knows the age of
   the counters.
-- [sp_IndexCleanup](https://github.com/erikdarlingdata/DarlingData) (version 2.10, MIT licence)
+- [sp_IndexCleanup](https://github.com/erikdarlingdata/DarlingData) (version 2.11, MIT licence)
   by Erik Darling finds unused and duplicate indexes and writes the script. It picks a keeper
   inside each duplicate set. It sets a warning flag under 14 days of uptime. At 7 days or less it
   switches itself to duplicate-only mode. The 14-day floor here is borrowed from it.
@@ -119,9 +119,9 @@ The self-test prints the same 313 assertions on Windows (Python 3.9.25 and 3.13.
 (Python 3.12.3). The three outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
-Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it reported 100 percent at 302
-assertions, and I did not repeat that run at 313, because the module is not installed there. I
-did not measure coverage on Python 3.9.
+Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 313
+assertions, with a pure-Python copy of `coverage` placed beside the script and nothing installed
+on the host. I did not measure coverage on Python 3.9.
 
 ```
 git clone https://github.com/uhsear/sdeindex.git
@@ -444,9 +444,11 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   written as split tokens, such as `'DROP ' + 'INDEX'`. The `EXEC` itself is reported as
   `UNPROVEN`, so the audit exits 1. A `DROP INDEX` written whole inside `EXEC('...')` is read as a
   statement, and the `EXEC` line is reported too.
-- The version numbers of sp_IndexCleanup and sp_BlitzIndex are those I read on 2026-10-12. Later
-  releases may differ. The sp_IndexCleanup claims describe version 2.10, and the current release is
-  2.11, which I did not re-read.
+- The version numbers of sp_IndexCleanup (2.11, dated 2026-11-01) and sp_BlitzIndex (8.34) are
+  those I read. Later releases may differ.
+- Microsoft documents `VIEW SERVER PERFORMANCE STATE` for `sys.dm_os_sys_info` on SQL Server 2022
+  and later, but `VIEW SERVER STATE` alone for `sys.dm_db_index_usage_stats`. I did not test
+  whether `VIEW SERVER PERFORMANCE STATE` is enough for both.
 - `--out` takes any path you can write, including one outside the working folder. `--apply`
   creates it without asking, and only an existing file is protected.
 - Error messages print the file paths you passed, and a refusal quotes the offending CSV value.
@@ -512,14 +514,14 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   indexes per table, three key shapes and a third of the indexes listed. 3000 indexes with 1000
   drops took 0.24 seconds. 30000 indexes with 10000 drops took 4.5 seconds. The time depends on the
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
-  square of its length to scan, about 45 seconds here, because each statement looks ahead for its
-  end. These timings come from one Windows machine and vary by about a factor of two.
+  square of its length to scan, about 200 seconds here (20000 statements took 6.6 seconds), because each statement looks
+  ahead for its end. These timings come from one Windows machine and vary by about a factor of two.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
   tool cannot detect the cut.
 - The CSV must be UTF-8 or UTF-16 with a header row and a comma delimiter. A `;` or tab delimiter,
-  or a `#TYPE` first line from Windows PowerShell `Export-Csv`, exits 3 with a missing-columns
-  message that does not name the delimiter. A legacy ANSI file, such as cp1252, exits 3 as not
+  or a `#TYPE` first line from Windows PowerShell `Export-Csv`, exits 3 with a refusal that says
+  the header is one field and to save the file with commas. A legacy ANSI file, such as cp1252, exits 3 as not
   UTF-8 or UTF-16. UTF-16 with no byte order mark gets the missing-columns refusal.
 - Spaces at the start or end of an index or table name are stripped when the CSV is read, so a
   script written for such a name would name a different index. A NUL byte in a field is read as it
@@ -568,6 +570,18 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - Two filters that differ only in white space inside a string literal, such as `'Park  Ground'`
   and `'Park Ground'`, are read as identical, because the tool collapses white space in a filter.
   A plan can then drop one of two indexes that are not the same.
+- A script saved as UTF-16 without a byte order mark is read as UTF-8 text full of NUL bytes, so it
+  exits 3 with the wrong-file message. Save the script as UTF-8 or as UTF-16 with a byte order
+  mark.
+- After an exit 2 from `--apply`, such as an existing `--out` file or a missing `--out` folder,
+  the report above the error can still show the verdict line, but no script was written. Read the
+  exit code, not the verdict line.
+- The self-test checks that the source imports no network module by reading import lines only. It
+  does not prove that no code opens a socket. A search of the source for `urllib`, `http`,
+  `socket`, `requests`, `getpass`, `input` and `environ` finds nothing outside the self-test.
+- A non-unique index with the same keys as a unique, non-constraint index is reported as
+  `identical to ... which stays`. The tool does not compare `is_unique`. The drop is safe, because
+  the unique index stays, but the word identical is looser than the test.
 - A script saved from SSMS with Script Index as DROP starts with `USE`, so it exits 3 until you
   delete that line.
 - The audit reads plain T-SQL only. A SQLCMD directive such as `:r other.sql`, `:connect` or `!!`

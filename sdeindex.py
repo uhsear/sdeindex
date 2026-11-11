@@ -2085,7 +2085,7 @@ def self_test():
           "<-- pinned defect")
     check(dynamic_lines("EXECUTE (@s)\nEXEC sp_executesql @s;\nx.exec\n"
                         "exec\r\nexecutes") == [1, 2, 4],
-          "EXEC, EXECUTE and sp_executesql are found once per line, "
+          "exec, execute and sp_executesql are found once per line, "
           "whatever the case")
     check(dynamic_lines("sys.sp_executesql @s;\nmaster..sp_executesql @s;\n"
                         "[sys].[sp_executesql] @s;\nsys.[sp_executesql] @s\n"
@@ -2108,13 +2108,13 @@ def self_test():
            "a list with a DROP DATABASE is refused whole  <-- pinned defect",
            "DROP DATABASE removes every index it holds")
     raises(lambda: parse_drops("drop database if exists [gis_prod]"),
-           "DROP DATABASE is found in any case and with a quoted name",
+           "drop database is found in any case and with a quoted name",
            "line 1")
     lines, code, units = analyse(
         twins, None, "-- EXEC (@s)\nPRINT 'EXEC (@s)';\nSELECT [exec], "
         "\"execute\", /* sp_executesql */ 1;\nDROP INDEX ix_a ON gis.t;")
     check(code == 0 and dynamic_lines("SELECT 1") == [],
-          "EXEC in a comment, a string or a quoted name is not dynamic SQL")
+          "exec in a comment, a string or a quoted name is not dynamic SQL")
     raises(lambda: analyse(story, REG_CSV, "DROP INDEX ix_owner_2 ON "
                            "gis.parcels;\nDROP TABLE gis.a_7;"),
            "a list with a DROP TABLE is refused whole", "DROP TABLE")
