@@ -16,6 +16,9 @@ applies those rules. Without --drops it plans its own cleanup. With --drops it
 audits somebody else's script of DROP INDEX, ALTER INDEX ... DISABLE or
 ALTER TABLE ... DROP [CONSTRAINT] statements, the last two being forms
 sp_IndexCleanup writes, and refuses every removal the rules forbid.
+sp_IndexCleanup names the database in every statement. Take that part out
+first: a table name with a database part is refused. A script that runs EXEC
+or sp_executesql is never a clean audit, because the text it runs is not read.
 
     python sdeindex.py --self-test
     python sdeindex.py --print-query
@@ -634,6 +637,10 @@ _USE = re.compile(r"(?<![\w@#$.])(?P<use>USE)(?![\w@#$])\s+\S", re.I)
 _SCAN = re.compile(r"--[^\r\n]*|/\*|'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]"
                    r"|\"(?:[^\"]|\"\")*\"|['\[\"]")
 _BLOCK = re.compile(r"/\*|\*/")
+# EXEC, EXECUTE and sp_executesql run text the scan cannot read. A word inside a
+# string, a quoted name or a comment is blanked first, so it does not count.
+_DYNAMIC = re.compile(
+    r"(?<![\w@#$.])(?:EXEC(?:UTE)?|SP_EXECUTESQL)(?![\w@#$])", re.I)
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\"(?:[^\"]|\"\")*\"")
 _BREAKS = re.compile(r"[;\r\n]")
 
@@ -795,6 +802,14 @@ def parse_drops(text):
     return out
 
 
+def dynamic_lines(text):
+    """The line numbers where EXEC, EXECUTE or sp_executesql appears outside a
+    string, a quoted name and a comment."""
+    clean = _QUOTED.sub(lambda m: blank(m.group()), strip_comments(text))
+    return sorted(set(clean.count("\n", 0, m.start()) + 1
+                      for m in _DYNAMIC.finditer(clean)))
+
+
 def one_line(text):
     """The text with line breaks written out, so a name that holds one cannot
     end a '--' comment and leave the rest of the name as live SQL."""
@@ -935,7 +950,14 @@ def analyse(index_text, registry_text=None, drops_text=None,
         decisions = plan(model, uptime, min_days)
         return (head + describe_plan(decisions), 0,
                 [(u, why) for act, u, why in decisions if act == DROP])
-    results = audit(model, parse_drops(drops_text), uptime, min_days)
+    entries = parse_drops(drops_text)
+    results = audit(model, entries, uptime, min_days)
+    # A removal built inside EXEC or sp_executesql cannot be read, so a script
+    # that runs dynamic SQL is never a clean audit.
+    results += [(UNPROVEN, "line %d" % n, "EXEC, EXECUTE or sp_executesql "
+                 "runs text this tool cannot read. The script may remove an "
+                 "index that was never judged")
+                for n in dynamic_lines(drops_text)]
     # An UNPROVEN drop exits 1 too: a gate that reads only the exit code must
     # not pass a drop the rules could not judge.
     code = 1 if any(r[0] != SAFE for r in results) else 0
@@ -1614,6 +1636,15 @@ def self_test():
                   "ALTER TABLE gdb_test.dbo.roads DROP uq_x;"):
         raises(lambda: parse_drops(other), "a database part is refused on "
                "every statement form  <-- pinned defect", "database part")
+    cleanup = ("ALTER INDEX [ix_d] ON [gisdb].[gis].[roads] DISABLE;\n"
+               "ALTER TABLE [gisdb].[gis].[roads] DROP CONSTRAINT [uq_x];")
+    raises(lambda: parse_drops(cleanup), "an sp_IndexCleanup script, which "
+           "names the database in every statement, is refused until the "
+           "database part is taken out  <-- pinned defect", "Take the "
+           "database part out")
+    check([e[:3] for e in parse_drops(cleanup.replace("[gisdb].", ""))] ==
+          [("gis", "roads", "ix_d"), ("gis", "roads", "uq_x")],
+          "the same script is read once the database part is gone")
     got = parse_drops("-- DROP INDEX no ON t\n/* DROP INDEX no\n ON t */\n"
                       "DROP INDEX yes ON gis.t;")
     check(got == [("gis", "t", "yes", 4)],
@@ -2021,6 +2052,24 @@ def self_test():
     check(code == 1 and units == [] and "could not be proven safe" in
           lines[-1],
           "an audit with an unproven drop exits 1  <-- pinned defect")
+    lines, code, units = analyse(
+        twins, None, "DECLARE @s nvarchar(200) = N'DROP' + N' INDEX ix_a ON "
+        "gis.t'; EXEC (@s);\nDROP INDEX ix_b ON gis.t;")
+    body = "\n".join(lines)
+    check(code == 1 and "SAFE      [gis].[t].[ix_b]" in body and
+          "UNPROVEN  line 1  EXEC, EXECUTE or sp_executesql" in body and
+          "1 of 2 could not be proven safe" in lines[-1],
+          "a removal built inside EXEC is never a clean audit  "
+          "<-- pinned defect")
+    check(dynamic_lines("EXECUTE (@s)\nEXEC sp_executesql @s;\nx.exec\n"
+                        "exec\r\nexecutes") == [1, 2, 4],
+          "EXEC, EXECUTE and sp_executesql are found once per line, "
+          "whatever the case")
+    lines, code, units = analyse(
+        twins, None, "-- EXEC (@s)\nPRINT 'EXEC (@s)';\nSELECT [exec], "
+        "\"execute\", /* sp_executesql */ 1;\nDROP INDEX ix_a ON gis.t;")
+    check(code == 0 and dynamic_lines("SELECT 1") == [],
+          "EXEC in a comment, a string or a quoted name is not dynamic SQL")
     raises(lambda: analyse(story, REG_CSV, "DROP INDEX ix_owner_2 ON "
                            "gis.parcels;\nDROP TABLE gis.a_7;"),
            "a list with a DROP TABLE is refused whole", "DROP TABLE")

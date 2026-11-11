@@ -58,6 +58,7 @@ PASS  an alter table ... drop constraint naming a plain index is unproven, not j
 PASS  a keyword-less alter table ... drop naming a plain index is unproven too  <-- pinned defect
 ...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
+PASS  a removal built inside EXEC is never a clean audit  <-- pinned defect
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
 ...
@@ -70,7 +71,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-302 assertions, 0 failed
+307 assertions, 0 failed
 ```
 
 ## What already exists
@@ -98,9 +99,10 @@ belong to the geodatabase. And each one judges its own run. A script that someon
 keeper, and no tool above checks it.
 
 This tool adds two things. It knows the geodatabase rules. And its audit mode reads any script of
-`DROP INDEX`, `ALTER INDEX ... DISABLE` or `ALTER TABLE ... DROP CONSTRAINT` statements, including
+`DROP INDEX`, `ALTER INDEX ... DISABLE` or `ALTER TABLE ... DROP CONSTRAINT` statements, such as
 the `DISABLE` and `DROP CONSTRAINT` scripts that sp_IndexCleanup writes, and judges the whole
-script against the export. A repository search of
+script against the export. sp_IndexCleanup writes the database name into every table name, so you
+must take that part out before the audit, or the run exits 3 and judges nothing. A repository search of
 GitHub for `sdeindex` returned only this repository on 2026-11-10.
 
 ## Requirements
@@ -110,11 +112,13 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 302 assertions on Windows (Python 3.13.2), on Windows with Python
-3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
+The self-test prints the same 307 assertions on Windows (Python 3.13.2) and on Ubuntu (Python
+3.12.3). The outputs match line for line once line endings are normalised. The run on Windows with
+Python 3.9.25 matched at 302 assertions, before the last five were added, and I did not repeat it. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
-Windows with Python 3.13.2 and on Ubuntu with Python 3.12.3. I did not measure coverage on
+Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it reported 100 percent at 302
+assertions, and I did not repeat that run for the last five. I did not measure coverage on
 Python 3.9.
 
 ```
@@ -254,7 +258,7 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | Statement | Read as |
 |---|---|
 | `DROP INDEX name ON schema.table` | A removal. `IF EXISTS` and a `WITH (...)` clause are read past. |
-| `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index. |
+| `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index, with a database part in the table name that you must take out first. |
 | `ALTER TABLE schema.table DROP [CONSTRAINT] [IF EXISTS] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too, and `IF EXISTS` is read past. If `name` is an index with no primary key or unique constraint behind it, the statement cannot drop that index, and the verdict is `UNPROVEN`. |
 | `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
@@ -410,7 +414,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   audit refuses it, because it rewrites an index that a drop may rely on. The merge scripts that
   sp_IndexCleanup writes are therefore not audited as they stand. Audit only the `DISABLE` and
   `DROP CONSTRAINT` scripts that sp_IndexCleanup writes, in a file of their own, because its merge
-  scripts are refused whole.
+  scripts are refused whole. Those scripts name the database in every table, as
+  `[db].[schema].[table]`, and the tool refuses that with exit 3. Delete the `[db].` part from each
+  statement first, then audit the script against the export of that database.
   `ALTER TABLE ... DROP CONSTRAINT` is read as the removal of that constraint's index. A constraint
   that is not an index, such as a foreign key, is refused as not in the index export.
   The name in a constraint drop is looked up among the indexes of that table. When it matches an
@@ -423,15 +429,20 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
   index that the tool judges can be rewritten by those forms, so no verdict changes.
 - An exit 0 from an audit means that every removal the tool could read is safe. It does not mean
-  the script is safe. A removal that the tool skips, such as one inside dynamic SQL, can sit in
-  a script that exits 0.
+  the script is safe. A script that has `EXEC`, `EXECUTE` or `sp_executesql` outside a string, a
+  quoted name and a comment gets an `UNPROVEN` line and exits 1, because the text it runs is not
+  read. A removal that is hidden some other way, such as through a linked server or a job, can still
+  sit in a script that exits 0.
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
 - Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
-  read. A removal built by joining string pieces inside `EXEC` is not seen, and neither is one
-  written as split tokens, such as `'DROP ' + 'INDEX'`.
+  read. A removal built by joining string pieces inside `EXEC` is not read, and neither is one
+  written as split tokens, such as `'DROP ' + 'INDEX'`. The `EXEC` itself is reported as
+  `UNPROVEN`, so the audit exits 1. A `DROP INDEX` written whole inside `EXEC('...')` is read as a
+  statement, and the `EXEC` line is reported too.
 - The version numbers of sp_IndexCleanup and sp_BlitzIndex are those I read on 2026-10-12. Later
-  releases may differ.
+  releases may differ. The sp_IndexCleanup claims describe version 2.10, and the current release is
+  2.11, which I did not re-read.
 - `--out` takes any path you can write, including one outside the working folder. `--apply`
   creates it without asking, and only an existing file is protected.
 - Error messages print the file paths you passed, and a refusal quotes the offending CSV value.
@@ -447,8 +458,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - A four-part table name (server.db.schema.table) is refused with exit 3, as a table name with a
   database part. In `ALTER TABLE srv.db.gis.t DROP uq_x` it is refused as unreadable, also with
   exit 3. Remove the server and database parts.
-- A table name with an empty part, such as `gis..t`, is read as table `gis` with no schema. It is
-  refused only because no such table is in the export.
+- A table name with an empty part, such as `gis..t`, is read as having no schema and is refused as
+  unqualified.
 - A base-table index and its protected adds-table twin print as one unit in the plan `KEEP` line,
   so the count of units can be lower than the count of indexes kept.
 - Listing the same index twice in an audited script prints `SAFE` twice and writes one `DROP INDEX`
@@ -467,9 +478,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the words of the next one. `ALTER INDEX ix_q ON gis.parcels REBUILD` followed by
   `DISABLE TRIGGER trg ON DATABASE;` on the next line is read as one statement with a `DISABLE`
   in it, and the run exits 3 as unreadable.
-- A `USE` statement, and a database part in a table name, are refused, so a multi-database script
-  from sp_IndexCleanup is refused, not judged against one database's export. Split it by database
-  and audit each script against the export of its own database. An unquoted index or table named
+- A `USE` statement, and a database part in a table name, are refused. A script from
+  sp_IndexCleanup names the database in every statement, so it is refused until you take that part
+  out. A script for several databases is not judged against one database's export. Split it by
+  database and audit each script against the export of its own database. An unquoted index or table named
   `use` is refused as a `USE` statement; bracket it. An index target with no
   schema (`ON parcels`) is refused in an audit, even when only one schema holds that table in the
   export, because SQL Server resolves it with the connection's default schema, which the export
@@ -494,7 +506,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   refused. An audit matches each listed drop against every index, so the time grows with listed
   drops times indexes. I measured it on Windows with Python 3.13, on a synthetic export of five
   indexes per table, three key shapes and a third of the indexes listed. 3000 indexes with 1000
-  drops took 0.2 seconds. 30000 indexes with 10000 drops took 4 seconds. The time depends on the
+  drops took 0.24 seconds. 30000 indexes with 10000 drops took 4.5 seconds. The time depends on the
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
   square of its length to scan, about 45 seconds here, because each statement looks ahead for its
   end. These timings come from one Windows machine and vary by about a factor of two.
@@ -551,6 +563,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - Two filters that differ only in white space inside a string literal, such as `'Park  Ground'`
   and `'Park Ground'`, are read as identical, because the tool collapses white space in a filter.
   A plan can then drop one of two indexes that are not the same.
+- A script saved from SSMS with Script Index as DROP starts with `USE`, so it exits 3 until you
+  delete that line.
+- The tool writes no CSV. A report that you paste into a spreadsheet is not guarded against cells
+  that start with `=`, `+`, `-` or `@`.
 - A failed `--self-test` exits 1, the code an audit also uses for findings. A gate cannot tell a
   broken tool from a refused list. Read the last line of the output.
 - On Linux, a Windows path passed to `--drops`, such as `C:\dir\file.sql`, is copied whole into the
