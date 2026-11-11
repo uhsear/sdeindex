@@ -59,6 +59,9 @@ PASS  a keyword-less alter table ... drop naming a plain index is unproven too  
 ...
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
 PASS  a removal built inside EXEC is never a clean audit  <-- pinned defect
+PASS  a qualified or quoted sp_executesql is dynamic SQL, called without EXEC  <-- pinned defect
+...
+PASS  a list with a DROP DATABASE is refused whole  <-- pinned defect (message names 'DROP DATABASE removes every index it holds')
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
 ...
@@ -71,7 +74,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-307 assertions, 0 failed
+313 assertions, 0 failed
 ```
 
 ## What already exists
@@ -112,14 +115,13 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 307 assertions on Windows (Python 3.13.2) and on Ubuntu (Python
-3.12.3). The outputs match line for line once line endings are normalised. The run on Windows with
-Python 3.9.25 matched at 302 assertions, before the last five were added, and I did not repeat it. Windows
+The self-test prints the same 313 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
+(Python 3.12.3). The three outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
 Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it reported 100 percent at 302
-assertions, and I did not repeat that run for the last five. I did not measure coverage on
-Python 3.9.
+assertions, and I did not repeat that run at 313, because the module is not installed there. I
+did not measure coverage on Python 3.9.
 
 ```
 git clone https://github.com/uhsear/sdeindex.git
@@ -261,7 +263,7 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | `ALTER INDEX name ON schema.table DISABLE` | A removal. This is the form sp_IndexCleanup writes for an index, with a database part in the table name that you must take out first. |
 | `ALTER TABLE schema.table DROP [CONSTRAINT] [IF EXISTS] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too, and `IF EXISTS` is read past. If `name` is an index with no primary key or unique constraint behind it, the statement cannot drop that index, and the verdict is `UNPROVEN`. |
 | `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
-| `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
+| `DROP TABLE`, `DROP DATABASE` | Refused. They remove every index on the table or in the database, and the run exits 3. |
 | `USE database`, anywhere in the script, also after `IF` or `BEGIN` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. A `use` inside a string or brackets is text, not a switch. |
 | A table name with a database part, such as `ON db.gis.parcels` or `ALTER TABLE db.gis.t DROP uq` | Refused, and the run exits 3. The export carries no database name, so the tool cannot tell whether the statement aims at the exported database. Take the database part out and audit the script against the export of that database. |
 | `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
@@ -298,8 +300,7 @@ Each rule below has assertions in the self-test. The label says where.
 | An adds-table index and its base-table twin go together or not at all. | Half a pair is neither the old state nor the new one. | Self-test, "without its adds twin". |
 | A read on either twin keeps the pair. | The counters of the two tables are separate. | Self-test, "a read on the adds twin". |
 | Indexes on `a_<id>` and `d_<id>` are judged only when `--registry` proves the table. | Esri names the delta tables `a_<registration_id>` and `d_<registration_id>`, in the schema of the versioned table. | [Esri, geodatabase system tables in SQL Server](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-sql-server/geodatabase-system-tables-sqlserver.html) |
-| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents `D<n>_PK` over `DELETED_AT` in prose and `sde_deleted_at` in a table, and indexes over `SDE_STATE_ID` and `SDE_DELETES_ROW_ID`, on its delta tables. The tool does not protect a base-table index by column name, but a base index that twins a
-protected adds-table index is kept with it (plan `KEEP`, audit `REFUSED`). | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
+| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents `D<n>_PK` over `DELETED_AT` in prose and `sde_deleted_at` in a table, and indexes over `SDE_STATE_ID` and `SDE_DELETES_ROW_ID`, on its delta tables. The tool does not protect a base-table index by column name, but a base index that twins a protected adds-table index is kept with it (plan `KEEP`, audit `REFUSED`). | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
 | Anything in the `sde` schema, or on an `SDE_` or `GDB_` table, is never dropped. | These are geodatabase system tables. | The Esri page above lists both prefixes. |
 | The ObjectID index is never dropped. | Esri's SDK help: "An attribute index on object id cannot be deleted." The index is unique, and the unique rule protects it. Esri's Oracle help names it `R<N>_SDE_ROWID_UK`, and the tool also protects that pattern by name. | [Esri, SchemaBuilder.Delete](https://doc.esri.com/en/arcgis-pro/latest/sdk/api-reference/topic40928.html) |
 | Primary key, unique constraint, unique, spatial, hash and clustered indexes are never dropped. | Some enforce a rule. The counters never see spatial and memory-optimized indexes. | [Microsoft, sys.dm_db_index_usage_stats](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-index-usage-stats-transact-sql) |
@@ -331,8 +332,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   tool reads. It cannot check that the T-SQL runs. Run it on a test copy first. If it fails,
   that is a bug, and the fix is in `INDEX_QUERY`. The registry query reads `sde.SDE_table_registry`.
   Use `dbo.SDE_table_registry` where the geodatabase system tables sit in the `dbo` schema. The
-  column names of `SDE_table_registry` come from memory, not from Esri documentation. A wrong name
-  fails loudly when the registry query runs.
+  column names of `SDE_table_registry` come from memory, not from Esri documentation. Esri's
+  system-tables page documents the table and `registration_id`, and I could not find an Esri page
+  that lists the other registry columns. A wrong name fails loudly when the registry query runs.
 - The delta-table rules rest on Esri's documented names. Esri's SQL Server help names the adds and
   deletes tables. It names no index on them. The tool assumes the Oracle column names hold in SQL
   Server, and protects any adds-table index over one of them. Esri's Oracle help names the
@@ -431,7 +433,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - An exit 0 from an audit means that every removal the tool could read is safe. It does not mean
   the script is safe. A script that has `EXEC`, `EXECUTE` or `sp_executesql` outside a string, a
   quoted name and a comment gets an `UNPROVEN` line and exits 1, because the text it runs is not
-  read. A removal that is hidden some other way, such as through a linked server or a job, can still
+  read. A schema or database name before `sp_executesql`, such as `sys.sp_executesql`, and a quoted
+  name, such as `[sys].[sp_executesql]`, count too. Microsoft allows a procedure call without `EXEC`
+  as the first statement of a batch, so these forms are legal. A removal that is hidden some other way, such as through a linked server or a job, can still
   sit in a script that exits 0.
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
@@ -543,7 +547,6 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   copies it into one of its two child Python processes, which prints none of it. The self-test reads its
   own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
-
 - `ALTER TABLE t DROP INDEX ix`, the form Microsoft documents for memory-optimized tables, is
   refused with exit 3 as a statement the tool cannot read. Nothing is judged.
 - The `DROP CONSTRAINT` scripts that sp_IndexCleanup writes for unique-constraint indexes are read
@@ -553,8 +556,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   backward compatibility, are refused with exit 3 as unreadable. Write `DROP INDEX index ON
   schema.table`.
 - The claim that SSMS and `sqlcmd` read a line of only `GO` inside a bracketed name as a batch
-  separator rests on how those clients split batches. I found no Microsoft page that says it and
-  I did not run it, because no SQL Server client was available.
+  separator rests on how those clients split batches. Microsoft's [GO page](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/sql-server-utilities-statements-go)
+  says that `GO` is a command of those utilities and that a statement cannot share its line. It does
+  not say what the utilities do inside a bracketed name. I did not run it, because no SQL Server
+  client was available.
 - A name that holds a line break and a line of only `GO` is written inside the brackets of the
   `DROP INDEX` line of the script. A person who can create indexes on a table can plant such a
   name, and the text after the `GO` line then runs as separate batches. Read the script before
@@ -565,6 +570,18 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   A plan can then drop one of two indexes that are not the same.
 - A script saved from SSMS with Script Index as DROP starts with `USE`, so it exits 3 until you
   delete that line.
+- The audit reads plain T-SQL only. A SQLCMD directive such as `:r other.sql`, `:connect` or `!!`
+  is ignored, so a removal in an included file is not seen and the audit can exit 0. Audit a
+  script that has none of them.
+- Only `EXEC`, `EXECUTE` and `sp_executesql` mark a script as holding text the tool cannot read. A
+  bare call of another procedure that removes indexes, such as `sp_MSforeachtable` with a
+  removal in its argument, or `xp_cmdshell`, is not detected, and the audit can exit 0.
+- The script `--apply` writes always uses `DROP INDEX`, even when the audited statement was an
+  `ALTER INDEX ... DISABLE`, which `REBUILD` undoes. Rewrite it as `DISABLE` yourself if you want
+  the reversible step.
+- The audit is not tuned for an export of more than about 50,000 indexes. Its cost grows with the
+  number of listed drops times the number of index groups, so a very large export with thousands
+  of listed drops can take minutes.
 - The tool writes no CSV. A report that you paste into a spreadsheet is not guarded against cells
   that start with `=`, `+`, `-` or `@`.
 - A failed `--self-test` exits 1, the code an audit also uses for findings. A gate cannot tell a

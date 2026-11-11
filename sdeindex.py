@@ -18,7 +18,9 @@ ALTER TABLE ... DROP [CONSTRAINT] statements, the last two being forms
 sp_IndexCleanup writes, and refuses every removal the rules forbid.
 sp_IndexCleanup names the database in every statement. Take that part out
 first: a table name with a database part is refused. A script that runs EXEC
-or sp_executesql is never a clean audit, because the text it runs is not read.
+or sp_executesql, also with a schema or database name before it, is never a
+clean audit, because the text it runs is not read. DROP TABLE and DROP DATABASE
+are refused.
 
     python sdeindex.py --self-test
     python sdeindex.py --print-query
@@ -587,8 +589,8 @@ def audit(model, entries, uptime, min_days=DEFAULT_MIN_UPTIME_DAYS):
                    "the connection's default schema, which the export does "
                    "not show; name the schema")
         else:
-            why = "not in the index export, so nothing shows it is safe"
-        out.append((REFUSED, "line %d: %s is %s" % (line, bracket(name), why),
+            why = "is not in the index export, so nothing shows it is safe"
+        out.append((REFUSED, "line %d: %s %s" % (line, bracket(name), why),
                     label))
     return [(v, label, reason) for v, reason, label in out]
 
@@ -619,6 +621,7 @@ _DROPS_COLUMN = re.compile(r"\s*(?:COLUMN|PERIOD)\b", re.I)
 _THEN_CONSTRAINT = re.compile(r",\s*CONSTRAINT\b", re.I)
 _WORDS = re.compile(
     r"\b(DROP\s+INDEX|ALTER\s+INDEX|ALTER\s+TABLE|DROP\s+TABLE|"
+    r"DROP\s+DATABASE|"
     r"CREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?(?:COLUMNSTORE\s+)?"
     r"INDEX)\b", re.I)
 _REWRITE = re.compile(r"\bDROP_EXISTING\s*=\s*ON\b", re.I)
@@ -639,8 +642,15 @@ _SCAN = re.compile(r"--[^\r\n]*|/\*|'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]"
 _BLOCK = re.compile(r"/\*|\*/")
 # EXEC, EXECUTE and sp_executesql run text the scan cannot read. A word inside a
 # string, a quoted name or a comment is blanked first, so it does not count.
+# A qualified call, sys.sp_executesql or master..sp_executesql, counts too.
 _DYNAMIC = re.compile(
-    r"(?<![\w@#$.])(?:EXEC(?:UTE)?|SP_EXECUTESQL)(?![\w@#$])", re.I)
+    r"(?<![\w@#$.])EXEC(?:UTE)?(?![\w@#$])"
+    r"|(?<![\w@#$])SP_EXECUTESQL(?![\w@#$])", re.I)
+# The call with its name quoted, [sys].[sp_executesql]. It is searched with only
+# the strings blanked, because the other search blanks a quoted name.
+_DYNAMIC_QUOTED = re.compile(r'(?<![\w@#$])[\["]SP_EXECUTESQL[\]"](?![\w@#$])',
+                             re.I)
+_STRING = re.compile(r"'(?:[^']|'')*'")
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\"(?:[^\"]|\"\")*\"")
 _BREAKS = re.compile(r"[;\r\n]")
 
@@ -745,10 +755,10 @@ def parse_drops(text):
     for n, word in enumerate(words):
         line = clean.count("\n", 0, word.start()) + 1
         kind = " ".join(word.group(1).upper().split())
-        if kind == "DROP TABLE":
-            raise Refused("line %d: DROP TABLE removes every index on the "
-                          "table, and this tool does not judge it. Take it "
-                          "out of the list." % line)
+        if kind in ("DROP TABLE", "DROP DATABASE"):
+            raise Refused("line %d: %s removes every index it holds, and this "
+                          "tool does not judge it. Take it out of the list."
+                          % (line, kind))
         if kind == "DROP INDEX":
             m = _DROP.match(clean, word.start())
             shape = "DROP INDEX name ON schema.table"
@@ -805,9 +815,13 @@ def parse_drops(text):
 def dynamic_lines(text):
     """The line numbers where EXEC, EXECUTE or sp_executesql appears outside a
     string, a quoted name and a comment."""
-    clean = _QUOTED.sub(lambda m: blank(m.group()), strip_comments(text))
+    bare = strip_comments(text)
+    clean = _QUOTED.sub(lambda m: blank(m.group()), bare)
+    quoted = _STRING.sub(lambda m: blank(m.group()), bare)
     return sorted(set(clean.count("\n", 0, m.start()) + 1
-                      for m in _DYNAMIC.finditer(clean)))
+                      for m in _DYNAMIC.finditer(clean)) |
+                  set(quoted.count("\n", 0, m.start()) + 1
+                      for m in _DYNAMIC_QUOTED.finditer(quoted)))
 
 
 def one_line(text):
@@ -919,9 +933,12 @@ def read_rows(text, needed, what):
             raise Refused("%s has a column name twice in its header." % what)
         missing = [n for n in needed if n not in names]
         if missing:
+            comma = (" The header is one field, so the delimiter may be a "
+                     "semicolon or a tab. Save the file with commas."
+                     if len(names) == 1 else "")
             raise Refused("%s has no %s column. The query --print-query "
-                          "writes the columns this tool reads."
-                          % (what, ", ".join(missing)))
+                          "writes the columns this tool reads.%s"
+                          % (what, ", ".join(missing), comma))
         reader.fieldnames = names
         pairs = [(reader.line_num, row) for row in reader]
     except csv.Error as exc:
@@ -1585,7 +1602,9 @@ def self_test():
           r18[0][1] == "[parcels].[ix_a]",
           "an unqualified name in two schemas is refused")
     r18b = audit(build([mk("ix_a")]), [(None, "parcels", "ix_a", 3)], mid)
-    check(r18b[0][0] == REFUSED and "default schema" in r18b[0][2],
+    check(r18b[0][0] == REFUSED and "default schema" in r18b[0][2] and
+          r18b[0][2].startswith("line 3: [ix_a] has no schema") and
+          "is has" not in r18b[0][2],
           "an unqualified table is refused even when one schema holds it, "
           "because SQL Server resolves it with the default schema  "
           "<-- pinned defect")
@@ -1931,6 +1950,9 @@ def self_test():
            "a header with a name twice is refused", "name twice")
     raises(lambda: read_rows("a,b\n1,2\n", ("a", "c"), "the export"),
            "a missing column is named", "no c column")
+    raises(lambda: read_rows("a;b\n1;2\n", ("a", "b"), "the export"),
+           "a semicolon-delimited file is told to use commas  "
+           "<-- pinned defect", "Save the file with commas")
     raises(lambda: read_rows("a,b\n", ("a",), "the export"),
            "a header with no rows is refused", "no rows")
     raises(lambda: read_rows("a\n" + "x" * 200000 + "\n", ("a",), "the export"),
@@ -2065,6 +2087,29 @@ def self_test():
                         "exec\r\nexecutes") == [1, 2, 4],
           "EXEC, EXECUTE and sp_executesql are found once per line, "
           "whatever the case")
+    check(dynamic_lines("sys.sp_executesql @s;\nmaster..sp_executesql @s;\n"
+                        "[sys].[sp_executesql] @s;\nsys.[sp_executesql] @s\n"
+                        "\"sys\".\"sp_executesql\" @s;\n[SP_ExecuteSQL] @s") ==
+          [1, 2, 3, 4, 5, 6],
+          "a qualified or quoted sp_executesql is dynamic SQL, called without "
+          "EXEC  <-- pinned defect")
+    check(dynamic_lines("PRINT 'sys.sp_executesql [sp_executesql]';\n"
+                        "-- [sys].[sp_executesql]\nSELECT x.sp_executesqlx, "
+                        "[sp_executesqlx];") == [],
+          "a quoted sp_executesql in a string or comment, or a longer name, "
+          "is not dynamic SQL")
+    lines, code, units = analyse(
+        twins, None, "DROP INDEX ix_b ON gis.t;\nGO\nsys.sp_executesql @s;")
+    check(code == 1 and "UNPROVEN  line 3" in "\n".join(lines),
+          "a safe drop plus sys.sp_executesql is not a clean audit  "
+          "<-- pinned defect")
+    raises(lambda: analyse(twins, None, "DROP INDEX ix_b ON gis.t;\n"
+                           "DROP DATABASE gis_prod;"),
+           "a list with a DROP DATABASE is refused whole  <-- pinned defect",
+           "DROP DATABASE removes every index it holds")
+    raises(lambda: parse_drops("drop database if exists [gis_prod]"),
+           "DROP DATABASE is found in any case and with a quoted name",
+           "line 1")
     lines, code, units = analyse(
         twins, None, "-- EXEC (@s)\nPRINT 'EXEC (@s)';\nSELECT [exec], "
         "\"execute\", /* sp_executesql */ 1;\nDROP INDEX ix_a ON gis.t;")
