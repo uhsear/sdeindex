@@ -4,7 +4,8 @@ Plan or audit an index cleanup for an enterprise geodatabase in SQL Server. Refu
 that removes both copies of an identical pair, and refuses half of a base-table and adds-table
 twin. Protects the indexes the geodatabase owns. Holds every "unused" verdict until the SQL Server
 instance has run long enough for the usage counters to mean something. It cannot see how old an
-index is, so it says so on every planned drop, and you check that age yourself.
+index is, so it says so on every drop that rests on an unread verdict, and you check that age
+yourself.
 
 A parcel layer is versioned. Its table has a nonclustered index on the owner column. The index is
 there twice, because two people added it a year apart. A report lists the indexes nobody reads,
@@ -69,7 +70,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-298 assertions, 0 failed
+302 assertions, 0 failed
 ```
 
 ## What already exists
@@ -109,7 +110,7 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 298 assertions on Windows (Python 3.13.2), on Windows with Python
+The self-test prints the same 302 assertions on Windows (Python 3.13.2), on Windows with Python
 3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
@@ -151,8 +152,9 @@ python sdeindex.py indexes.csv --registry registry.csv --drops naive.sql --out s
 | `--print-query` | off | Print the two export queries and exit. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
-`--self-test` ignores any other argument: `python sdeindex.py --self-test indexes.csv` runs the
-self-test and exits 0.
+`--self-test` ignores any other argument that parses: `python sdeindex.py --self-test indexes.csv`
+runs the self-test and exits 0. An argument the parser refuses, such as a bad `--min-uptime-days`
+value, still exits 64 before the self-test starts.
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--appl` is refused
 with exit 64 instead of being read as `--apply`.
@@ -292,7 +294,8 @@ Each rule below has assertions in the self-test. The label says where.
 | An adds-table index and its base-table twin go together or not at all. | Half a pair is neither the old state nor the new one. | Self-test, "without its adds twin". |
 | A read on either twin keeps the pair. | The counters of the two tables are separate. | Self-test, "a read on the adds twin". |
 | Indexes on `a_<id>` and `d_<id>` are judged only when `--registry` proves the table. | Esri names the delta tables `a_<registration_id>` and `d_<registration_id>`, in the schema of the versioned table. | [Esri, geodatabase system tables in SQL Server](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-sql-server/geodatabase-system-tables-sqlserver.html) |
-| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents `D<n>_PK` over `DELETED_AT` in prose and `sde_deleted_at` in a table, and indexes over `SDE_STATE_ID` and `SDE_DELETES_ROW_ID`, on its delta tables. The tool does not protect a base-table index by column name. | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
+| Every index on a deletes table, and any index on an adds table over `sde_state_id`, `sde_deletes_row_id` or `deleted_at`, is never dropped. | The geodatabase creates them. Esri's Oracle help documents `D<n>_PK` over `DELETED_AT` in prose and `sde_deleted_at` in a table, and indexes over `SDE_STATE_ID` and `SDE_DELETES_ROW_ID`, on its delta tables. The tool does not protect a base-table index by column name, but a base index that twins a
+protected adds-table index is kept with it (plan `KEEP`, audit `REFUSED`). | [Esri, Oracle configuration parameters](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-oracle/configuration-parameters-oracle.html) |
 | Anything in the `sde` schema, or on an `SDE_` or `GDB_` table, is never dropped. | These are geodatabase system tables. | The Esri page above lists both prefixes. |
 | The ObjectID index is never dropped. | Esri's SDK help: "An attribute index on object id cannot be deleted." The index is unique, and the unique rule protects it. Esri's Oracle help names it `R<N>_SDE_ROWID_UK`, and the tool also protects that pattern by name. | [Esri, SchemaBuilder.Delete](https://doc.esri.com/en/arcgis-pro/latest/sdk/api-reference/topic40928.html) |
 | Primary key, unique constraint, unique, spatial, hash and clustered indexes are never dropped. | Some enforce a rule. The counters never see spatial and memory-optimized indexes. | [Microsoft, sys.dm_db_index_usage_stats](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-index-usage-stats-transact-sql) |
@@ -354,8 +357,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - The uptime line describes the instance, not the index. The usage counters cannot show when an
   index was created, so an index added last week on a server that has run for 90 days is reported
   as having no reads in 90 days of uptime. It has had less time to be read than the line says.
-  Every planned `DROP` and every `SAFE` unread verdict ends with "The export cannot show when the
-  index was created", so the plan does not hide the gap, but it cannot close it. Check the age of
+  Every planned `DROP` of an unread index and every `SAFE` unread verdict ends with "The export
+  cannot show when the index was created". A `DROP` of a copy identical to one that stays says
+  only that, because the age of the copy does not decide it. The plan does not hide the gap, but
+  it cannot close it. Check the age of
   each index before you run the script.
 - Usage counters belong to one instance. On an Always On readable secondary, reads served there
   are not in the primary's export, so an index can look unread when it is used. I found no
@@ -444,6 +449,14 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   exit 3. Remove the server and database parts.
 - A table name with an empty part, such as `gis..t`, is read as table `gis` with no schema. It is
   refused only because no such table is in the export.
+- A base-table index and its protected adds-table twin print as one unit in the plan `KEEP` line,
+  so the count of units can be lower than the count of indexes kept.
+- Listing the same index twice in an audited script prints `SAFE` twice and writes one `DROP INDEX`
+  line.
+- An audit that exits 1 can still write a script with `--apply`. The script holds the `SAFE` units
+  only and carries no line that says other listed drops were refused.
+- A usage counter or uptime value of 20 or more digits is refused with exit 3, as a value that is
+  not a plausible count.
 - A `DROP INDEX` inside an `IF` block, or under any other condition, is read as unconditional.
   The audit judges it as if it always ran.
 - An unquoted index name that starts with a non-ASCII letter is refused as unreadable. Bracket it
@@ -458,8 +471,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   from sp_IndexCleanup is refused, not judged against one database's export. Split it by database
   and audit each script against the export of its own database. An unquoted index or table named
   `use` is refused as a `USE` statement; bracket it. An index target with no
-  schema (`ON parcels`) is matched to the one schema that holds that table in the export, but SQL
-  Server resolves it with the connection's default schema. Write the schema on every statement.
+  schema (`ON parcels`) is refused in an audit, even when only one schema holds that table in the
+  export, because SQL Server resolves it with the connection's default schema, which the export
+  does not show. Write the schema on every statement.
 - When a base-table index and an identical adds-table twin pair up, and a second identical base
   copy exists, which base copy is the twin follows name order. Listing the other base copy can be
   refused as leaving its twin behind even though the drop is safe. The error is on the safe side.
@@ -518,11 +532,6 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
 
-- The WIP `CONSTRAINT`-keyword edit on `origin/wip/2026-10-12` is already on main, as commit 23d8ef9
-  with the fixes in d71a9ba, and each form has pinned self-test assertions. That branch is an
-  interrupted edit on an older base. Applying it would undo review fixes, and it would make
-  `ALTER TABLE gis.parcels DROP ix_a;` on a plain index a `SAFE` verdict, where main says
-  `UNPROVEN`. Do not merge it.
 - `ALTER TABLE t DROP INDEX ix`, the form Microsoft documents for memory-optimized tables, is
   refused with exit 3 as a statement the tool cannot read. Nothing is judged.
 - The `DROP CONSTRAINT` scripts that sp_IndexCleanup writes for unique-constraint indexes are read

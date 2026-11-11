@@ -509,6 +509,8 @@ def audit(model, entries, uptime, min_days=DEFAULT_MIN_UPTIME_DAYS):
     plain = {}
     for n, entry in enumerate(entries):
         schema, table, name, line = entry
+        if schema is None:
+            continue
         hits = model.find(schema, table, name)
         if len(hits) != 1:
             continue
@@ -576,12 +578,15 @@ def audit(model, entries, uptime, min_days=DEFAULT_MIN_UPTIME_DAYS):
             ix = found[entry]
             out.append(verdict[ix.key] + (ix.label,))
             continue
-        hits = model.find(schema, table, name)
         label = ".".join(bracket(p) for p in (schema, table, name) if p)
-        out.append((REFUSED, "line %d: %s is %s" % (
-            line, bracket(name), "in more than one schema; name the schema"
-            if hits else "not in the index export, so nothing shows it is "
-                         "safe"), label))
+        if schema is None:
+            why = ("has no schema on its table. SQL Server resolves it with "
+                   "the connection's default schema, which the export does "
+                   "not show; name the schema")
+        else:
+            why = "not in the index export, so nothing shows it is safe"
+        out.append((REFUSED, "line %d: %s is %s" % (line, bracket(name), why),
+                    label))
     return [(v, label, reason) for v, reason, label in out]
 
 
@@ -1554,9 +1559,19 @@ def self_test():
           "<-- pinned defect")
     r18 = audit(build([mk("ix_a"), mk("ix_a", schema="hr")]),
                 [(None, "parcels", "ix_a", 3)], mid)
-    check(r18[0][0] == REFUSED and "more than one schema" in r18[0][2] and
+    check(r18[0][0] == REFUSED and "name the schema" in r18[0][2] and
           r18[0][1] == "[parcels].[ix_a]",
           "an unqualified name in two schemas is refused")
+    r18b = audit(build([mk("ix_a")]), [(None, "parcels", "ix_a", 3)], mid)
+    check(r18b[0][0] == REFUSED and "default schema" in r18b[0][2],
+          "an unqualified table is refused even when one schema holds it, "
+          "because SQL Server resolves it with the default schema  "
+          "<-- pinned defect")
+    r18c = audit(build([mk("ix_a"), mk("ix_a", schema="hr")]),
+                 [("zz", "parcels", "ix_a", 3), ("hr", "parcels", "ix_a", 4)],
+                 mid)
+    check(r18c[0][0] == REFUSED and "not in the index export" in r18c[0][2],
+          "a named schema that holds no such index is refused")
     r19 = audit(build([mk("ix_a"), mk("ix_a", schema="hr")]),
                 [("hr", "parcels", "ix_a", 3)], mid)
     check(r19[0][0] == SAFE, "naming the schema picks the one index")
