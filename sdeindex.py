@@ -466,7 +466,8 @@ def usage_verdict(unit, uptime, min_days):
     if uptime < min_days * 24:
         return False, "no reads, but the counters cover only %s of uptime " \
                       "and the floor is %d days" % (days(uptime), min_days)
-    return True, "no reads in %s of uptime, %d write(s) paid for nothing" \
+    return True, "no reads in %s of uptime, %d write(s) paid for nothing. " \
+                 "The export cannot show when the index was created" \
                  % (days(uptime), unit.writes)
 
 
@@ -614,9 +615,12 @@ _WORDS = re.compile(
 _REWRITE = re.compile(r"\bDROP_EXISTING\s*=\s*ON\b", re.I)
 _DISABLE = re.compile(r"\bDISABLE\b", re.I)
 _WITH = re.compile(r"\s*WITH\s*\(", re.I)
-# USE at the start of a statement. A script that switches database names objects
-# the export knows nothing about.
-_USE = re.compile(r"(?:^|[;\r\n])\s*(?P<use>USE)\s+\S", re.I)
+# The word USE followed by a name, wherever it sits: after IF, ELSE, BEGIN or a
+# semicolon. A script that switches database names objects the export knows
+# nothing about. Strings and quoted names are blanked before the search, so
+# [use] and 'use x' are not a switch. An unquoted index named use is refused
+# too; bracket it.
+_USE = re.compile(r"(?<![\w@#$.])(?P<use>USE)(?![\w@#$])\s+\S", re.I)
 
 # One left-to-right scan, so a '--' or '/*' inside a string or a bracketed
 # name is not a comment, and a quote inside a comment is not a string. A lone
@@ -717,7 +721,7 @@ def parse_drops(text):
     removals. DROP TABLE removes every index on the table, so it is refused."""
     clean = strip_comments(text)
     masked = mask_quoted(clean)
-    use = _USE.search(masked)
+    use = _USE.search(_QUOTED.sub(lambda m: blank(m.group()), clean))
     if use:
         raise Refused("line %d: USE switches database, and the export holds "
                       "one database. Take it out, then audit the script "
@@ -770,6 +774,11 @@ def parse_drops(text):
                           "its WITH clause never closes. Write one statement "
                           "per index." % line)
         parts = [unquote(p) for p in re.findall(_NAME, m.group("table"))]
+        if len(parts) > 2:
+            raise Refused("line %d: the table name has a database part, and "
+                          "the export holds one database. Take the database "
+                          "part out, then audit the script against the export "
+                          "of the database it runs in." % line)
         schema = parts[-2] if len(parts) > 1 else None
         out.append(Entry(schema, parts[-1], unquote(m.group("name")), line,
                          kind == "ALTER TABLE"))
@@ -955,8 +964,9 @@ def _parse(argv):
                     help="CSV from the query --print-query writes")
     ap.add_argument("--registry", help="CSV of the geodatabase table "
                     "registry. Needed when a table is named a_<id> or d_<id>")
-    ap.add_argument("--drops", help="a DROP INDEX / ALTER INDEX ... DISABLE "
-                    "script to audit instead of planning one")
+    ap.add_argument("--drops", help="a DROP INDEX / ALTER INDEX ... DISABLE / "
+                    "ALTER TABLE ... DROP [CONSTRAINT] script to audit "
+                    "instead of planning one")
     ap.add_argument("--min-uptime-days", type=_days,
                     default=DEFAULT_MIN_UPTIME_DAYS,
                     help="days of usage counters an unused verdict needs "
@@ -1411,11 +1421,16 @@ def self_test():
           "1 read" in mix, "the plan report splits the kept by reason")
     check(describe_plan(twin_plan) == [
         "DROP      [gis].[parcels].[ix_zone] + twin [gis].[a_7].[ix_zone]  "
-        "no reads in 30.0 days of uptime, 0 write(s) paid for nothing",
+        "no reads in 30.0 days of uptime, 0 write(s) paid for nothing. "
+        "The export cannot show when the index was created",
         "KEEP      0 unit(s): 0 protected by a rule, 0 read", "",
         "VERDICT: 1 drop(s) planned, 0 for review, 0 held for uptime"],
         "each decision is printed once, under its own action  "
         "<-- pinned defect")
+    check("cannot show when the index was created" in "".join(
+        describe_plan(plan(build([mk("ix_new")]), 1440))),
+          "a drop of an unread index says the export cannot show its age  "
+          "<-- pinned defect")
     pk_twin = build([mk("ix_pk", keys="[zone]", pk=True),
                      mk("ix_pk", "a_7", keys="[zone]")], registry)
     check(actions(plan(pk_twin, mid)) == [(KEEP, "ix_pk")] and
@@ -1565,8 +1580,15 @@ def self_test():
           "lower case, IF EXISTS and double quotes are read")
     check(parse_drops("DROP INDEX ix ON parcels")[0][:3] ==
           (None, "parcels", "ix"), "a table with no schema reads as None")
-    check(parse_drops("DROP INDEX ix ON db.gis.parcels")[0][:3] ==
-          ("gis", "parcels", "ix"), "a three-part table name keeps the schema")
+    raises(lambda: parse_drops("DROP INDEX ix ON db.gis.parcels"),
+           "a three-part table name is refused, so a drop aimed at another "
+           "database is not judged against this export  <-- pinned defect",
+           "database part")
+    for other in ("ALTER INDEX [ix_d] ON [gdb_test].[dbo].[roads] DISABLE;",
+                  "ALTER TABLE gdb_test.dbo.roads DROP CONSTRAINT uq_x;",
+                  "ALTER TABLE gdb_test.dbo.roads DROP uq_x;"):
+        raises(lambda: parse_drops(other), "a database part is refused on "
+               "every statement form  <-- pinned defect", "database part")
     got = parse_drops("-- DROP INDEX no ON t\n/* DROP INDEX no\n ON t */\n"
                       "DROP INDEX yes ON gis.t;")
     check(got == [("gis", "t", "yes", 4)],
@@ -1603,7 +1625,7 @@ def self_test():
           "a WITH clause with nested brackets is read past")
     raises(lambda: parse_drops("SELECT 1"), "a file with no statement is "
            "refused", "holds no DROP INDEX")
-    check(parse_drops("ALTER TABLE [db].[gis].[parcels] DROP CONSTRAINT "
+    check(parse_drops("ALTER TABLE [gis].[parcels] DROP CONSTRAINT "
                       "[uq_x];") == [("gis", "parcels", "uq_x", 1)],
           "alter table ... drop constraint is read as a removal, as "
           "sp_IndexCleanup scripts it  <-- pinned defect")
@@ -1697,13 +1719,12 @@ def self_test():
           [("gis", "t]u", "a]b", 1)],
           "a closing bracket doubled inside a bracketed name is read as one "
           "bracket")
-    check(parse_drops("DROP INDEX a ON gis . t;\nDROP INDEX b ON x\n.\ny\n.t;") ==
+    check(parse_drops("DROP INDEX a ON gis . t;\nDROP INDEX b ON y\n.\nt;") ==
           [("gis", "t", "a", 1), ("y", "t", "b", 2)],
           "white space around the dots of a table name is read")
-    check(parse_drops("DROP INDEX a ON srv.db.gis.t;")[0][:3] ==
-          ("db", "gis", "a"),
-          "a four-part table name is read as its first three parts, a "
-          "documented limit")
+    raises(lambda: parse_drops("DROP INDEX a ON srv.db.gis.t;"),
+           "a four-part table name is refused, not read as schema db",
+           "database part")
     for use in ("USE [Db2];\nDROP INDEX a ON gis.t;",
                 "DROP INDEX a ON gis.t;\r\nuse Db2\r\nDROP INDEX b ON gis.t;",
                 "DROP INDEX a ON gis.t; USE db2; DROP INDEX b ON gis.t;"):
@@ -1793,6 +1814,15 @@ def self_test():
     check(parse_drops("PRINT 'a; use b\nuse c';\nDROP INDEX a ON gis.t;") ==
           [("gis", "t", "a", 3)],
           "a USE inside a string is not a USE statement  <-- pinned defect")
+    for use in ("IF 1 = 1 USE [other];\nDROP INDEX a ON gis.t;",
+                "IF DB_ID('x') IS NOT NULL\nUSE x\nDROP INDEX a ON gis.t;",
+                "BEGIN USE x; END\nDROP INDEX a ON gis.t;"):
+        raises(lambda: parse_drops(use), "a USE after IF or BEGIN is refused, "
+               "not judged  <-- pinned defect", "USE switches database")
+    check(parse_drops("DROP INDEX [use] ON gis.t;\nDROP INDEX a ON "
+                      "[use x];\nPRINT 'use x';") ==
+          [("gis", "t", "use", 1), (None, "use x", "a", 2)],
+          "a quoted use is a name, and a use in a string is text")
     raises(lambda: parse_drops("\nUSE db2"), "a USE refusal after a leading "
            "newline names line 2", "line 2:")
     raises(lambda: parse_drops("\nPRINT 'open"), "an unclosed string after a "
@@ -1921,8 +1951,8 @@ def self_test():
              seeks=900),
         xrow("parcels", "ix_x", keys="[x] ASC", seeks=5)], "720")
     lines, code, units = analyse(cons, None,
-        "ALTER TABLE [db].[gis].[parcels] DROP CONSTRAINT [uq_parcel_id];\n"
-        "ALTER INDEX [ix_x] ON [db].[gis].[parcels] DISABLE;")
+        "ALTER TABLE [gis].[parcels] DROP CONSTRAINT [uq_parcel_id];\n"
+        "ALTER INDEX [ix_x] ON [gis].[parcels] DISABLE;")
     body = "\n".join(lines)
     check(code == 1 and "REFUSED   [gis].[parcels].[uq_parcel_id]  backs a "
           "UNIQUE constraint" in body and "UNPROVEN  [gis].[parcels].[ix_x]"

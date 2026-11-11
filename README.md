@@ -3,7 +3,8 @@
 Plan or audit an index cleanup for an enterprise geodatabase in SQL Server. Refuses a drop list
 that removes both copies of an identical pair, and refuses half of a base-table and adds-table
 twin. Protects the indexes the geodatabase owns. Holds every "unused" verdict until the SQL Server
-instance has run long enough for the usage counters to mean something.
+instance has run long enough for the usage counters to mean something. It cannot see how old an
+index is, so it says so on every planned drop, and you check that age yourself.
 
 A parcel layer is versioned. Its table has a nonclustered index on the owner column. The index is
 there twice, because two people added it a year apart. A report lists the indexes nobody reads,
@@ -68,7 +69,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-290 assertions, 0 failed
+298 assertions, 0 failed
 ```
 
 ## What already exists
@@ -108,7 +109,7 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 290 assertions on Windows (Python 3.13.2), on Windows with Python
+The self-test prints the same 298 assertions on Windows (Python 3.13.2), on Windows with Python
 3.9.25 and on Ubuntu (Python 3.12.3). The outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
@@ -205,7 +206,7 @@ $ python sdeindex.py indexes.csv --registry registry.csv
 uptime: 30.0 days of usage counters, floor 14 days
 
 DROP      [gis].[parcels].[ix_owner_2]  identical to [gis].[parcels].[ix_owner_1], which stays
-DROP      [gis].[parcels].[ix_zone] + twin [gis].[a_7].[ix_zone]  no reads in 30.0 days of uptime, 240 write(s) paid for nothing
+DROP      [gis].[parcels].[ix_zone] + twin [gis].[a_7].[ix_zone]  no reads in 30.0 days of uptime, 240 write(s) paid for nothing. The export cannot show when the index was created
 REVIEW    [gis].[parcels].[ix_owner_1]  every copy is unread, and this is the one the plan keeps. Judge it in a later run, after its duplicates are gone
 KEEP      5 unit(s): 4 protected by a rule, 1 read
 
@@ -255,7 +256,8 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | `ALTER TABLE schema.table DROP [CONSTRAINT] [IF EXISTS] name` | The removal of the index behind that constraint. sp_IndexCleanup writes this for a unique constraint. Microsoft makes the `CONSTRAINT` keyword optional, so `DROP uq_x` is read too, and `IF EXISTS` is read past. If `name` is an index with no primary key or unique constraint behind it, the statement cannot drop that index, and the verdict is `UNPROVEN`. |
 | `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
 | `DROP TABLE` | Refused. It removes every index on the table, and the run exits 3. |
-| `USE database` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. |
+| `USE database`, anywhere in the script, also after `IF` or `BEGIN` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. A `use` inside a string or brackets is text, not a switch. |
+| A table name with a database part, such as `ON db.gis.parcels` or `ALTER TABLE db.gis.t DROP uq` | Refused, and the run exits 3. The export carries no database name, so the tool cannot tell whether the statement aims at the exported database. Take the database part out and audit the script against the export of that database. |
 | `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
 | Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements, including `DROP COLUMN`, `DROP PERIOD` and `ALTER COLUMN ... DROP SPARSE` | Not removals. Skipped. |
 
@@ -352,6 +354,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - The uptime line describes the instance, not the index. The usage counters cannot show when an
   index was created, so an index added last week on a server that has run for 90 days is reported
   as having no reads in 90 days of uptime. It has had less time to be read than the line says.
+  Every planned `DROP` and every `SAFE` unread verdict ends with "The export cannot show when the
+  index was created", so the plan does not hide the gap, but it cannot close it. Check the age of
+  each index before you run the script.
 - Usage counters belong to one instance. On an Always On readable secondary, reads served there
   are not in the primary's export, so an index can look unread when it is used. I found no
   Microsoft page that states this for Always On. It is my reading of how the counters work. Export from every
@@ -434,11 +439,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - A `DROP INDEX`, `ALTER INDEX ... DISABLE` or `DROP CONSTRAINT` phrase inside a string, such as
   `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
   `UNPROVEN`, and `--apply` can write a drop the author did not list.
-- A four-part table name (server.db.schema.table) is split as schema `db` and table `gis`, because
-  the tool reads at most three parts. It is refused only because that pair is not in the export.
-  The refusal is right, but the label names the wrong table, such as `[db].[gis].[ix_q]`. Remove
-  the server part. In `ALTER TABLE srv.db.gis.t DROP uq_x` the four-part name is refused as
-  unreadable, with exit 3.
+- A four-part table name (server.db.schema.table) is refused with exit 3, as a table name with a
+  database part. In `ALTER TABLE srv.db.gis.t DROP uq_x` it is refused as unreadable, also with
+  exit 3. Remove the server and database parts.
 - A table name with an empty part, such as `gis..t`, is read as table `gis` with no schema. It is
   refused only because no such table is in the export.
 - A `DROP INDEX` inside an `IF` block, or under any other condition, is read as unconditional.
@@ -451,10 +454,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the words of the next one. `ALTER INDEX ix_q ON gis.parcels REBUILD` followed by
   `DISABLE TRIGGER trg ON DATABASE;` on the next line is read as one statement with a `DISABLE`
   in it, and the run exits 3 as unreadable.
-- A `USE` statement is refused. The database part of a three-part table name is ignored, so a
-  multi-database script from sp_IndexCleanup is judged against one database's export, and objects
-  with the same names in another database get that export's verdict. Audit a script only against
-  the export of the database it was written for. An index target with no
+- A `USE` statement, and a database part in a table name, are refused, so a multi-database script
+  from sp_IndexCleanup is refused, not judged against one database's export. Split it by database
+  and audit each script against the export of its own database. An unquoted index or table named
+  `use` is refused as a `USE` statement; bracket it. An index target with no
   schema (`ON parcels`) is matched to the one schema that holds that table in the export, but SQL
   Server resolves it with the connection's default schema. Write the schema on every statement.
 - When a base-table index and an identical adds-table twin pair up, and a second identical base
@@ -514,6 +517,35 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   copies it into one of its two child Python processes, which prints none of it. The self-test reads its
   own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
+
+- The WIP `CONSTRAINT`-keyword edit on `origin/wip/2026-10-12` is already on main, as commit 23d8ef9
+  with the fixes in d71a9ba, and each form has pinned self-test assertions. That branch is an
+  interrupted edit on an older base. Applying it would undo review fixes, and it would make
+  `ALTER TABLE gis.parcels DROP ix_a;` on a plain index a `SAFE` verdict, where main says
+  `UNPROVEN`. Do not merge it.
+- `ALTER TABLE t DROP INDEX ix`, the form Microsoft documents for memory-optimized tables, is
+  refused with exit 3 as a statement the tool cannot read. Nothing is judged.
+- The `DROP CONSTRAINT` scripts that sp_IndexCleanup writes for unique-constraint indexes are read
+  but always come back `REFUSED`, because the unique-constraint rule never allows the drop. Such a
+  script can never be `SAFE`.
+- The old `DROP INDEX table.index` and `schema.table.index` forms, which Microsoft keeps for
+  backward compatibility, are refused with exit 3 as unreadable. Write `DROP INDEX index ON
+  schema.table`.
+- The claim that SSMS and `sqlcmd` read a line of only `GO` inside a bracketed name as a batch
+  separator rests on how those clients split batches. I found no Microsoft page that says it and
+  I did not run it, because no SQL Server client was available.
+- A name that holds a line break and a line of only `GO` is written inside the brackets of the
+  `DROP INDEX` line of the script. A person who can create indexes on a table can plant such a
+  name, and the text after the `GO` line then runs as separate batches. Read the script before
+  you run it, or remove such names from the export.
+- The `--print-query` T-SQL and the registry column names were never run against SQL Server.
+- Two filters that differ only in white space inside a string literal, such as `'Park  Ground'`
+  and `'Park Ground'`, are read as identical, because the tool collapses white space in a filter.
+  A plan can then drop one of two indexes that are not the same.
+- A failed `--self-test` exits 1, the code an audit also uses for findings. A gate cannot tell a
+  broken tool from a refused list. Read the last line of the output.
+- On Linux, a Windows path passed to `--drops`, such as `C:\dir\file.sql`, is copied whole into the
+  first comment line of the script, because `os.path.basename` splits only on `/` there.
 
 ## Contributing
 
