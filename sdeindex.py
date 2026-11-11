@@ -17,10 +17,10 @@ audits somebody else's script of DROP INDEX, ALTER INDEX ... DISABLE or
 ALTER TABLE ... DROP [CONSTRAINT] statements, the last two being forms
 sp_IndexCleanup writes, and refuses every removal the rules forbid.
 sp_IndexCleanup names the database in every statement. Take that part out
-first: a table name with a database part is refused. A script that runs EXEC
-or sp_executesql, also with a schema or database name before it, is never a
-clean audit, because the text it runs is not read. DROP TABLE and DROP DATABASE
-are refused.
+first: a table name with a database part is refused. A script that runs EXEC,
+EXECUTE, sp_executesql, sp_prepare or sp_prepexec, also with a schema or
+database name before it, is never a clean audit, because the text it runs is
+not read. DROP TABLE and DROP DATABASE are refused.
 
     python sdeindex.py --self-test
     python sdeindex.py --print-query
@@ -640,16 +640,18 @@ _USE = re.compile(r"(?<![\w@#$.])(?P<use>USE)(?![\w@#$])\s+\S", re.I)
 _SCAN = re.compile(r"--[^\r\n]*|/\*|'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]"
                    r"|\"(?:[^\"]|\"\")*\"|['\[\"]")
 _BLOCK = re.compile(r"/\*|\*/")
-# EXEC, EXECUTE and sp_executesql run text the scan cannot read. A word inside a
-# string, a quoted name or a comment is blanked first, so it does not count.
-# A qualified call, sys.sp_executesql or master..sp_executesql, counts too.
+# EXEC, EXECUTE, sp_executesql, sp_prepare and sp_prepexec run text the scan
+# cannot read. A word inside a string, a quoted name or a comment is blanked
+# first, so it does not count. A qualified call, sys.sp_executesql or
+# master..sp_executesql, counts too.
 _DYNAMIC = re.compile(
     r"(?<![\w@#$.])EXEC(?:UTE)?(?![\w@#$])"
-    r"|(?<![\w@#$])SP_EXECUTESQL(?![\w@#$])", re.I)
+    r"|(?<![\w@#$])SP_(?:EXECUTESQL|PREPARE|PREPEXEC)(?![\w@#$])", re.I)
 # The call with its name quoted, [sys].[sp_executesql]. It is searched with only
 # the strings blanked, because the other search blanks a quoted name.
-_DYNAMIC_QUOTED = re.compile(r'(?<![\w@#$])[\["]SP_EXECUTESQL[\]"](?![\w@#$])',
-                             re.I)
+_DYNAMIC_QUOTED = re.compile(
+    r'(?<![\w@#$])[\["]SP_(?:EXECUTESQL|PREPARE|PREPEXEC)[\]"](?![\w@#$])',
+    re.I)
 _STRING = re.compile(r"'(?:[^']|'')*'")
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\"(?:[^\"]|\"\")*\"")
 _BREAKS = re.compile(r"[;\r\n]")
@@ -813,8 +815,8 @@ def parse_drops(text):
 
 
 def dynamic_lines(text):
-    """The line numbers where EXEC, EXECUTE or sp_executesql appears outside a
-    string, a quoted name and a comment."""
+    """The line numbers where EXEC, EXECUTE, sp_executesql, sp_prepare or
+    sp_prepexec appears outside a string, a quoted name and a comment."""
     bare = strip_comments(text)
     clean = _QUOTED.sub(lambda m: blank(m.group()), bare)
     quoted = _STRING.sub(lambda m: blank(m.group()), bare)
@@ -969,11 +971,11 @@ def analyse(index_text, registry_text=None, drops_text=None,
                 [(u, why) for act, u, why in decisions if act == DROP])
     entries = parse_drops(drops_text)
     results = audit(model, entries, uptime, min_days)
-    # A removal built inside EXEC or sp_executesql cannot be read, so a script
-    # that runs dynamic SQL is never a clean audit.
-    results += [(UNPROVEN, "line %d" % n, "EXEC, EXECUTE or sp_executesql "
-                 "runs text this tool cannot read. The script may remove an "
-                 "index that was never judged")
+    # A removal built inside EXEC, sp_executesql or sp_prepexec cannot be
+    # read, so a script that runs dynamic SQL is never a clean audit.
+    results += [(UNPROVEN, "line %d" % n, "EXEC, EXECUTE, sp_executesql, "
+                 "sp_prepare or sp_prepexec runs text this tool cannot read. "
+                 "The script may remove an index that was never judged")
                 for n in dynamic_lines(drops_text)]
     # An UNPROVEN drop exits 1 too: a gate that reads only the exit code must
     # not pass a drop the rules could not judge.
@@ -2079,7 +2081,7 @@ def self_test():
         "gis.t'; EXEC (@s);\nDROP INDEX ix_b ON gis.t;")
     body = "\n".join(lines)
     check(code == 1 and "SAFE      [gis].[t].[ix_b]" in body and
-          "UNPROVEN  line 1  EXEC, EXECUTE or sp_executesql" in body and
+          "UNPROVEN  line 1  EXEC, EXECUTE, sp_executesql" in body and
           "1 of 2 could not be proven safe" in lines[-1],
           "a removal built inside EXEC is never a clean audit  "
           "<-- pinned defect")
@@ -2093,6 +2095,21 @@ def self_test():
           [1, 2, 3, 4, 5, 6],
           "a qualified or quoted sp_executesql is dynamic SQL, called without "
           "EXEC  <-- pinned defect")
+    check(dynamic_lines("EXEC sp_prepexec @h OUTPUT, N'', @s;\n"
+                        "sp_prepare @h OUTPUT, N'', @s;\n"
+                        "sys.sp_prepexec @h;\n[sys].[sp_prepare] @h;") ==
+          [1, 2, 3, 4],
+          "sp_prepexec and sp_prepare run text, so they are dynamic SQL  "
+          "<-- pinned defect")
+    lines, code, units = analyse(
+        twins, None, "DROP INDEX ix_b ON gis.t;\nDECLARE @h int;\n"
+        "sp_prepexec @h OUTPUT, N'', @s;")
+    check(code == 1 and "UNPROVEN  line 3" in "\n".join(lines),
+          "a safe drop plus sp_prepexec is not a clean audit  "
+          "<-- pinned defect")
+    check(dynamic_lines("SELECT sp_prepexecx, [sp_prepared];"
+                        "PRINT 'sp_prepexec';") == [],
+          "a longer name or a string holding sp_prepexec is not dynamic SQL")
     check(dynamic_lines("PRINT 'sys.sp_executesql [sp_executesql]';\n"
                         "-- [sys].[sp_executesql]\nSELECT x.sp_executesqlx, "
                         "[sp_executesqlx];") == [],

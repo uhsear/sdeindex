@@ -3,7 +3,8 @@
 Plan or audit an index cleanup for an enterprise geodatabase in SQL Server. Refuses a drop list
 that removes both copies of an identical pair, and refuses half of a base-table and adds-table
 twin. Protects the indexes the geodatabase owns. Holds every "unused" verdict until the SQL Server
-instance has run long enough for the usage counters to mean something. It cannot see how old an
+instance has run long enough for the usage counters to mean something. (An identical duplicate is
+judged by identity, not by reads, so uptime does not hold it.) It cannot see how old an
 index is, so it says so on every drop that rests on an unread verdict, and you check that age
 yourself.
 
@@ -60,6 +61,8 @@ PASS  a keyword-less alter table ... drop naming a plain index is unproven too  
 PASS  an audit with an unproven drop exits 1  <-- pinned defect
 PASS  a removal built inside EXEC is never a clean audit  <-- pinned defect
 PASS  a qualified or quoted sp_executesql is dynamic SQL, called without EXEC  <-- pinned defect
+PASS  sp_prepexec and sp_prepare run text, so they are dynamic SQL  <-- pinned defect
+PASS  a safe drop plus sp_prepexec is not a clean audit  <-- pinned defect
 ...
 PASS  a list with a DROP DATABASE is refused whole  <-- pinned defect (message names 'DROP DATABASE removes every index it holds')
 ...
@@ -74,14 +77,15 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-313 assertions, 0 failed
+316 assertions, 0 failed
 ```
 
 ## What already exists
 
-Three tools find unused and duplicate indexes well. This tool does not replace them. I read their
-source on 2026-10-12. The self-test does not exercise these facts, because this repository
-holds none of their code.
+Three tools find unused and duplicate indexes well. This tool does not replace them. I read the
+source of sp_BlitzIndex and dbatools on 2026-10-12, and I read the source of sp_IndexCleanup again
+on 2026-11-11, when it was at version 2.11. The self-test does not exercise these facts, because
+this repository holds none of their code.
 
 - [sp_BlitzIndex](https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit) (version 8.34,
   July 2026) diagnoses a whole database. It reads the server start time, so it knows the age of
@@ -115,11 +119,11 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 313 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
+The self-test prints the same 316 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
 (Python 3.12.3). The three outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
-Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 313
+Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 316
 assertions, with a pure-Python copy of `coverage` placed beside the script and nothing installed
 on the host. I did not measure coverage on Python 3.9.
 
@@ -304,7 +308,7 @@ Each rule below has assertions in the self-test. The label says where.
 | Anything in the `sde` schema, or on an `SDE_` or `GDB_` table, is never dropped. | These are geodatabase system tables. | The Esri page above lists both prefixes. |
 | The ObjectID index is never dropped. | Esri's SDK help: "An attribute index on object id cannot be deleted." The index is unique, and the unique rule protects it. Esri's Oracle help names it `R<N>_SDE_ROWID_UK`, and the tool also protects that pattern by name. | [Esri, SchemaBuilder.Delete](https://doc.esri.com/en/arcgis-pro/latest/sdk/api-reference/topic40928.html) |
 | Primary key, unique constraint, unique, spatial, hash and clustered indexes are never dropped. | Some enforce a rule. The counters never see spatial and memory-optimized indexes. | [Microsoft, sys.dm_db_index_usage_stats](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-db-index-usage-stats-transact-sql) |
-| An unread index is held until the counters cover `--min-uptime-days`. | The counters start empty when the database engine starts. A detach or an `AUTO_CLOSE` shutdown also removes the rows. The floor measures the instance, not the database. | The Microsoft page above, and [sys.dm_os_sys_info](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-sys-info-transact-sql) for `sqlserver_start_time`. |
+| An unread index is held until the counters cover `--min-uptime-days`. An identical duplicate is not held, because its drop rests on the kept copy, not on reads. | The counters start empty when the database engine starts. A detach or an `AUTO_CLOSE` shutdown also removes the rows. The floor measures the instance, not the database. | The Microsoft page above, and [sys.dm_os_sys_info](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-sys-info-transact-sql) for `sqlserver_start_time`. |
 | With no `uptime_hours` column, no index is called unused. | The export cannot show the age of the counters. | Self-test, "no uptime". |
 
 Microsoft adds a row for an index on its first use, so a blank counter reads as 0.
@@ -431,11 +435,16 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
   index that the tool judges can be rewritten by those forms, so no verdict changes.
 - An exit 0 from an audit means that every removal the tool could read is safe. It does not mean
-  the script is safe. A script that has `EXEC`, `EXECUTE` or `sp_executesql` outside a string, a
-  quoted name and a comment gets an `UNPROVEN` line and exits 1, because the text it runs is not
-  read. A schema or database name before `sp_executesql`, such as `sys.sp_executesql`, and a quoted
-  name, such as `[sys].[sp_executesql]`, count too. Microsoft allows a procedure call without `EXEC`
-  as the first statement of a batch, so these forms are legal. A removal that is hidden some other way, such as through a linked server or a job, can still
+  the script is safe. A script that has `EXEC`, `EXECUTE`, `sp_executesql`, `sp_prepare` or
+  `sp_prepexec` outside a string, a quoted name and a comment gets an `UNPROVEN` line and exits 1,
+  because the text it runs is not read. A schema or database name before the procedure, such as
+  `sys.sp_executesql`, and a quoted name, such as `[sys].[sp_executesql]`, count too. Microsoft
+  allows a procedure call without `EXEC` as the first statement of a batch, so these forms are
+  legal. [sp_prepare](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepare-transact-sql)
+  prepares a statement for a later `sp_execute`, and
+  [sp_prepexec](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepexec-transact-sql)
+  prepares and runs it. Before this rule, a script that built a removal as text and ran it with
+  `sp_prepexec` exited 0. A removal that is hidden some other way, such as through a linked server or a job, can still
   sit in a script that exits 0.
 - A script with no removal statement at all is refused as the wrong file. A script of only
   `REBUILD`, `REORGANIZE` or `TRUNCATE` statements exits 3.
@@ -444,11 +453,11 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   written as split tokens, such as `'DROP ' + 'INDEX'`. The `EXEC` itself is reported as
   `UNPROVEN`, so the audit exits 1. A `DROP INDEX` written whole inside `EXEC('...')` is read as a
   statement, and the `EXEC` line is reported too.
-- The version numbers of sp_IndexCleanup (2.11, dated 2026-11-01) and sp_BlitzIndex (8.34) are
-  those I read. Later releases may differ.
-- Microsoft documents `VIEW SERVER PERFORMANCE STATE` for `sys.dm_os_sys_info` on SQL Server 2022
-  and later, but `VIEW SERVER STATE` alone for `sys.dm_db_index_usage_stats`. I did not test
-  whether `VIEW SERVER PERFORMANCE STATE` is enough for both.
+- The version numbers of sp_IndexCleanup (2.11, dated 2026-11-01, read on 2026-11-11) and
+  sp_BlitzIndex (8.34, read on 2026-10-12) are those I read. Later releases may differ.
+- Microsoft documents `VIEW SERVER PERFORMANCE STATE` for both `sys.dm_os_sys_info` and
+  `sys.dm_db_index_usage_stats` on SQL Server 2022 and later. I did not test the grant against a
+  server.
 - `--out` takes any path you can write, including one outside the working folder. `--apply`
   creates it without asking, and only an existing file is protected.
 - Error messages print the file paths you passed, and a refusal quotes the offending CSV value.
@@ -465,7 +474,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   database part. In `ALTER TABLE srv.db.gis.t DROP uq_x` it is refused as unreadable, also with
   exit 3. Remove the server and database parts.
 - A table name with an empty part, such as `gis..t`, is read as having no schema and is refused as
-  unqualified.
+  unqualified. In that refusal, the label shows the first part in the schema position, so
+  `DROP INDEX x ON gis..parcels` prints `[gis].[x]`, although SQL Server reads `gis` as the
+  database.
 - A base-table index and its protected adds-table twin print as one unit in the plan `KEEP` line,
   so the count of units can be lower than the count of indexes kept.
 - Listing the same index twice in an audited script prints `SAFE` twice and writes one `DROP INDEX`
@@ -515,7 +526,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   drops took 0.24 seconds. 30000 indexes with 10000 drops took 4.5 seconds. The time depends on the
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
   square of its length to scan, about 200 seconds here (20000 statements took 6.6 seconds), because each statement looks
-  ahead for its end. These timings come from one Windows machine and vary by about a factor of two.
+  ahead for its end. Timings were taken on one machine and vary by more than a factor of two; treat them as an order of
+  magnitude. A later run on Windows with Python 3.13.2 took about 1.8 s for the 20000-statement
+  script and 9.6 s on another run.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
   tool cannot detect the cut.
@@ -530,6 +543,20 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   SQL Server's only by Unicode normalisation is read as it is.
 - A `--` comment ends at a CR or an LF, so a script with bare CR line endings reads correctly.
   Line numbers in messages count LF only, so such a script reports every line as line 1.
+- Any `EXECUTE` keyword outside a string, a comment or a quoted name, including `EXECUTE AS`, is
+  reported `UNPROVEN`, not only a call at the start of a batch. So `CREATE PROCEDURE ... WITH
+  EXECUTE AS OWNER` exits 1. This errs on the safe side.
+- Only the `argparse` help text reads `COLUMNS` from the environment. The tool's own code reads no
+  environment variable on the plan and audit paths.
+- Microsoft behaviours the tool relies on, with their pages. The
+  [EXECUTE page](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql)
+  says "If the following is the first statement in a batch or a sqlcmd script, EXECUTE isn't
+  required." That is the basis for the bare and qualified `sp_executesql` rule. The export query
+  uses [STRING_AGG ... WITHIN GROUP](https://learn.microsoft.com/en-us/sql/t-sql/functions/string-agg-transact-sql),
+  and the columns `type_desc`, `is_hypothetical` and `is_disabled` of
+  [sys.indexes](https://learn.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-indexes-transact-sql),
+  and [sys.index_columns](https://learn.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-index-columns-transact-sql).
+  I did not run the query against SQL Server.
 - Only CR and LF are written out as `\r` and `\n` in the `--` comment lines of the script. Other
   Unicode line separators in a name are written as they are.
 - An unexpected Python error ends the run with a traceback and exit 2, not the 1 of a refused
@@ -577,8 +604,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the report above the error can still show the verdict line, but no script was written. Read the
   exit code, not the verdict line.
 - The self-test checks that the source imports no network module by reading import lines only. It
-  does not prove that no code opens a socket. A search of the source for `urllib`, `http`,
-  `socket`, `requests`, `getpass`, `input` and `environ` finds nothing outside the self-test.
+  does not prove that no code opens a socket. A search of the source for an import or a call of `urllib`, `http`,
+  `socket`, `requests`, `getpass`, `input()` and `environ` finds nothing outside the self-test.
 - A non-unique index with the same keys as a unique, non-constraint index is reported as
   `identical to ... which stays`. The tool does not compare `is_unique`. The drop is safe, because
   the unique index stays, but the word identical is looser than the test.
@@ -587,8 +614,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - The audit reads plain T-SQL only. A SQLCMD directive such as `:r other.sql`, `:connect` or `!!`
   is ignored, so a removal in an included file is not seen and the audit can exit 0. Audit a
   script that has none of them.
-- Only `EXEC`, `EXECUTE` and `sp_executesql` mark a script as holding text the tool cannot read. A
-  bare call of another procedure that removes indexes, such as `sp_MSforeachtable` with a
+- Only `EXEC`, `EXECUTE`, `sp_executesql`, `sp_prepare` and `sp_prepexec` mark a script as holding
+  text the tool cannot read. A bare call of another procedure that removes indexes, such as `sp_MSforeachtable` with a
   removal in its argument, or `xp_cmdshell`, is not detected, and the audit can exit 0.
 - The script `--apply` writes always uses `DROP INDEX`, even when the audited statement was an
   `ALTER INDEX ... DISABLE`, which `REBUILD` undoes. Rewrite it as `DISABLE` yourself if you want
