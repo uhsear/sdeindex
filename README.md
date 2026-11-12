@@ -495,7 +495,9 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   inside it as a batch separator. Rename the object, then export again. A line break at either end
   of a name is trimmed, not refused.
 - A procedure called without `EXEC` after a semicolon at the start of a batch, such as
-  `;dbo.cleanup;`, is not read as a call. I did not verify whether SQL Server accepts that form.
+  `;dbo.cleanup;`, is not read as a call, and the audit exits 0 with `all 1 listed drop(s) safe`. I did
+  not verify whether SQL Server accepts that form. It probably rejects it as a syntax error, so
+  it is unlikely to run.
 - A four-part table name (server.db.schema.table) is refused with exit 3, as a table name with a
   database part. In `ALTER TABLE srv.db.gis.t DROP uq_x` it is refused as unreadable, also with
   exit 3. Remove the server and database parts.
@@ -538,8 +540,13 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   whichever database the connection uses. Run it in the database you exported from. A second
   database with the same schema, table and index names, such as a test copy, would lose those
   indexes instead.
-- Index names are printed as they are, so a name with terminal escape codes can redraw the report
-  on screen. Read the report in a file, not only on screen.
+- Names that come from an audited `--drops` script are printed as written, so a script that holds
+  escape codes, or a line break in a bracketed name, can redraw the screen or forge a report line
+  that starts with `SAFE`. Read the report of an untrusted script in a file, and trust the
+  `VERDICT` line and the exit code. A name in the index export is stricter: the tool refuses a
+  control character in a schema, table or index name with exit 3, but only `\x00` to `\x1f`,
+  `\x7f`, U+0085, U+2028 and U+2029. Other C1 controls, such as U+009B (an 8-bit terminal CSI),
+  are printed as they are.
 - The script is written as UTF-8 with no byte order mark. SSMS can read a non-ASCII index name as
   ANSI when you open such a file. The tool reads a BOM and UTF-16 on input.
 - The tool reads the whole export into memory. A counter or an uptime of more than 19 digits is
@@ -550,7 +557,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   shape of the input. A script of 100000 `ALTER TABLE t` statements with no semicolon takes the
   square of its length to scan, about 200 seconds here (20000 statements took 6.6 seconds), because each statement looks
   ahead for its end. Timings were taken on one machine and vary by more than a factor of two; treat them as an order of
-  magnitude. A later run on Windows with Python 3.13.2 took about 1.8 s for the 20000-statement
+  magnitude. The 100000-statement figure of about 200 seconds is an extrapolation from the shorter
+  runs, not a measured run. A later run on Windows with Python 3.13.2 took about 1.8 s for the 20000-statement
   script and 9.6 s on another run.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
@@ -582,7 +590,36 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   and [sys.index_columns](https://learn.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-index-columns-transact-sql).
   I did not run the query against SQL Server.
 - Only CR and LF are written out as `\r` and `\n` in the `--` comment lines of the script. Other
-  Unicode line separators in a name are written as they are.
+  Unicode line separators in a name, and in the base name of the `--drops` file that the first
+  comment line quotes, are written as they are. SQL Server ends a `--` comment only at CR or LF,
+  so this is cosmetic unless a client splits lines differently.
+- A byte order mark in the middle of a script, such as from joining two UTF-8 files with a BOM,
+  is not read as part of a procedure name, so a bare procedure call after it is not marked. Strip
+  the marks before you join scripts.
+- A name with leading or trailing white space of any kind, such as a line feed or a tab, is
+  stripped before the control-character check, so the script drops the stripped name, which can
+  differ from the real one. SQL Server then reports the error when it runs the `DROP`.
+- The tool does not detect a nonclustered index on a memory-optimized table. Microsoft says
+  `sys.dm_db_index_usage_stats` returns nothing for memory-optimized indexes, so the plan can
+  call one unused. Only `NONCLUSTERED HASH` is held back. Keep such tables out of the export.
+- An `ALTER TABLE ... DROP CONSTRAINT` of a foreign key, `CHECK` or `DEFAULT` constraint, which has
+  no index, comes back `REFUSED` as not in the export. The direction is safe, but the wording
+  suggests a missing index. Audit such statements by hand.
+- A sqlcmd-style export can write the literal text `NULL` into a counter, `included_columns` or
+  `filter_definition` column. The tool reads a counter as 0 and the other two as the text `NULL`
+  without a refusal. The export query wraps these columns in `COALESCE`, so it never writes
+  `NULL`. Save the export from the grid, as the 256-character note above says.
+- The uptime comes from `DATEDIFF(hour, sqlserver_start_time, SYSDATETIME())`, which counts hour
+  boundaries crossed, not elapsed hours. The reported uptime can exceed the real uptime by up to
+  59 minutes, so an unread index at the 14-day floor can be planned for a drop up to 59 minutes
+  early.
+- A plan exits 0 when the export has no `uptime_hours` column, or when every unread index is held
+  for uptime, for example `VERDICT: 1 drop(s) planned, 0 for review, 2 held for uptime`. A gate
+  that reads only the exit code can pass such a plan. Read the `VERDICT` line.
+- Names are case-folded, so in a case-sensitive database two columns or indexes that differ only
+  in case are read as one.
+- A user table named `a<n>` or `d<n>` in the registry owner's schema is read as the delta table of
+  that registration, so its indexes can be paired with the twins of the base table.
 - An unexpected Python error ends the run with a traceback and exit 2, not the 1 of a refused
   audit, so a gate that reads the exit code can tell a crash from findings. Known causes: a file
   name that is not valid UTF-8 (seen on Linux), which can also leave an empty `--out` file, and a
@@ -640,7 +677,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   marked by its `EXEC`. A removal that runs through a linked server or a job is not seen,
   and the audit can exit 0.
 - A word in the batch-start list that is also the name of a procedure, such as a procedure named
-  `Set` called without `EXEC`, is read as a statement word and not marked. The list holds the
+  `Set`, `Move`, `Get`, `Send`, `Enable` or `Save` called without `EXEC`, is read as a statement
+  word and not marked. The list holds the
   T-SQL statement words I know. A new statement word that it lacks exits 1, which errs on the
   safe side.
 - The script `--apply` writes always uses `DROP INDEX`, even when the audited statement was an

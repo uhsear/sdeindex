@@ -1937,7 +1937,7 @@ def self_test():
     check(parse_drops("PRINT 'DROP TABLE t; CREATE INDEX a ON t (c) WITH "
                       "(DROP_EXISTING = ON)';\nDROP INDEX [it's] ON gis.t;"
                       )[0][2] == "it's",
-          "DROP TABLE and DROP_EXISTING inside a string do not refuse the "
+          "drop table and drop_existing inside a string do not refuse the "
           "script, and a quoted name keeps its apostrophe")
     raises(lambda: parse_drops("ALTER TABLE gis.t DROP uq_x, uq_y;"),
            "a keyword-less drop naming two constraints is refused",
@@ -2236,7 +2236,7 @@ def self_test():
     check("\n".join(lines).count("UNPROVEN  line 3") == 1,
           "a qualified sp_executesql that starts a batch is reported once")
     check(bare_call_lines("GO\n;x\nGO 2\r\nGO\n  go  \ndbo.p;\nGO\n") == [6],
-          "GO lines of any case or count cut batches, and an empty batch or "
+          "go lines of any case or count cut batches, and an empty batch or "
           "one that starts with a semicolon holds no call")
     check(bare_call_lines("GO\n\u00e9xec_p;\nGO\n#tmp;\nGO\n\u00e9") == [2, 4, 6],
           "a batch that starts with a non-ASCII letter or # is a call too  "
