@@ -33,6 +33,8 @@ PASS  a column list reads its order and folds case
 ...
 PASS  a superscript digit is refused, not a crash  <-- pinned defect
 ...
+PASS  a index_name with 'a\nGO\nSELECT 1' is refused, so no script can hold a planted batch  <-- pinned defect (message names 'index_name holds a control character')
+...
 PASS  a registry row with fewer fields than its header is refused  <-- pinned defect (message names 'registry line 3: the row has fewer fields')
 ...
 PASS  of two identical unread indexes the plan keeps one for review and drops the other  <-- pinned defect
@@ -52,6 +54,9 @@ PASS  a '--' comment ends at a bare CR, so the DROP after it is read  <-- pinned
 PASS  a USE statement is refused, so a script for another database is not judged against this export  <-- pinned defect (message names 'USE switches database')
 ...
 PASS  a constraint drop with no CONSTRAINT keyword is read as a removal  <-- pinned defect
+PASS  a SQLCMD line ':r hidden.sql' is refused, so an included file cannot hide a removal  <-- pinned defect (message names 'line 2: a SQLCMD command')
+...
+PASS  a DROP INDEX phrase inside a string, one that spans lines too, is text, not a removal  <-- pinned defect
 ...
 PASS  a column drop that goes on with a constraint is refused, not skipped  <-- pinned defect (message names 'ALTER TABLE schema.table DROP CONSTRAINT name')
 ...
@@ -68,6 +73,9 @@ PASS  a procedure called without EXEC after a GO line is not a clean audit  <-- 
 PASS  any name that starts a batch is a call, a system procedure too, with CRLF line ends  <-- pinned defect
 PASS  a quoted name that starts the script is a call too  <-- pinned defect
 ...
+PASS  a batch that starts with a non-ASCII letter or # is a call too  <-- pinned defect
+PASS  an apostrophe inside a bracketed name opens no string, so a later GO line and call are still seen  <-- pinned defect
+...
 PASS  a list with a DROP DATABASE is refused whole  <-- pinned defect (message names 'DROP DATABASE removes every index it holds')
 ...
 PASS  an audit of a merge script is refused whole, not judged against an index the script rewrites  <-- pinned defect (message names 'DROP_EXISTING')
@@ -81,7 +89,7 @@ PASS  a unique prefix --appl of --apply is refused by the parser  <-- pinned def
 PASS  a real closed output pipe exits 2 with one error line, not a traceback or the 1 of a refused audit  <-- pinned defect
 ...
 --------------------------------------------------------------------
-324 assertions, 0 failed
+349 assertions, 0 failed
 ```
 
 ## What already exists
@@ -123,13 +131,13 @@ The tool reads an index CSV, an optional registry CSV and, in audit mode, one sc
 one text file, and only with `--apply`. The self-test also writes a temporary directory, which it
 removes, and starts two child Python processes.
 
-The self-test prints the same 324 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
+The self-test prints the same 349 assertions on Windows (Python 3.9.25 and 3.13.2) and on Ubuntu
 (Python 3.12.3). The three outputs match line for line once line endings are normalised. Windows
 writes CRLF when you redirect to a file.
 `coverage run --branch sdeindex.py --self-test` reports 100 percent of lines and branches, on
-Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 324
-assertions, with `coverage` 7.17.0 in a virtual environment outside the checkout. I did not
-measure coverage on Python 3.9 or 3.10. The self-test also passes, with 324 assertions, on Python
+Windows with Python 3.13.2. On Ubuntu with Python 3.12.3 it also reported 100 percent at 349
+assertions, with `coverage` 7.16.2 in a virtual environment outside the checkout. I did not
+measure coverage on Python 3.9 or 3.10. The self-test also passes, with 349 assertions, on Python
 3.10.20 and 3.12 on Windows.
 
 ```
@@ -274,6 +282,7 @@ DROP INDEX [ix_owner_2] ON [gis].[parcels];
 | `ALTER TABLE ... DROP COLUMN c, CONSTRAINT k` | Refused, and the run exits 3. A column drop that goes on with a constraint names a constraint the tool does not read. Write the constraint drop as a statement of its own. |
 | `DROP TABLE`, `DROP DATABASE` | Refused. They remove every index on the table or in the database, and the run exits 3. |
 | `USE database`, anywhere in the script, also after `IF` or `BEGIN` | Refused, and the run exits 3. The export holds one database, so a script that switches database is not judged. Take the `USE` out and audit the script against the export of the database it runs in. A `use` inside a string or brackets is text, not a switch. |
+| A line that starts with a SQLCMD command, such as `:r file`, `:connect` or `:setvar`, or with `!!` | Refused, and the run exits 3. `sqlcmd` runs these outside the server, and an included file may hold removals this tool never reads. Take the line out and audit the included script on its own. Microsoft's [sqlcmd page](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-use-utility) shows `:connect`, `:setvar`, `:r` and `:exit` on lines of their own in script files, and the [sqlcmd utility page](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility) names `!!` *command*. I read both on 2026-11-12. The self-test checks how this tool reads a line, not what `sqlcmd` does with it. |
 | A table name with a database part, such as `ON db.gis.parcels` or `ALTER TABLE db.gis.t DROP uq` | Refused, and the run exits 3. The export carries no database name, so the tool cannot tell whether the statement aims at the exported database. Take the database part out and audit the script against the export of that database. |
 | `CREATE INDEX ... WITH (DROP_EXISTING = ON)` | Refused, and the run exits 3. It rewrites an index, so the copy a drop leaves behind may not be the index judged. This is the merge form sp_IndexCleanup writes. Audit the `DROP` statements in a file of their own. |
 | Other `CREATE INDEX`, `ALTER INDEX ... REBUILD` or `REORGANIZE`, other `ALTER TABLE` statements, including `DROP COLUMN`, `DROP PERIOD` and `ALTER COLUMN ... DROP SPARSE` | Not removals. Skipped. |
@@ -282,7 +291,8 @@ A statement with several targets, such as `DROP INDEX a ON t, b ON t`, is refuse
 `ALTER INDEX ALL`. Comments are ignored. A `--` or `/*` inside a string or a bracketed name does
 not start a comment, and block comments nest as T-SQL nests them. A string, quoted name or
 comment that never closes is refused. A `;` or a line break inside a string or a quoted name does
-not end or start a statement.
+not end or start a statement. A removal phrase inside a string, such as
+`PRINT 'DROP INDEX x ON t'`, is text and is not read.
 
 Microsoft documents the syntax this table relies on:
 [DROP INDEX](https://learn.microsoft.com/en-us/sql/t-sql/statements/drop-index-transact-sql)
@@ -401,7 +411,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - `--min-uptime-days 0` turns the uptime floor off. An export taken an hour after a restart then
   calls every unread index unused and plans a drop. That is your explicit choice.
 - Only nonclustered indexes are judged. The export query leaves out disabled and hypothetical
-  indexes. Compression, partitioning, fill factor, filegroup and data space are not compared, so two
+  indexes. Compression, partitioning, fill factor, filegroup, data space and every other index option,
+  such as `ALLOW_PAGE_LOCKS`, `SORT_IN_TEMPDB` or `IGNORE_DUP_KEY`, are not compared, so two
   indexes that differ only in those count as identical. The tool can drop a compressed copy and keep an uncompressed one.
 - The uptime line rounds to one decimal place. An export taken after 335 hours prints
   `14.0 days of usage counters, floor 14 days, so no index is called unused`. The line reads as
@@ -447,7 +458,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   allows a procedure call without `EXEC` as the first statement of a batch, so these forms are
   legal. The audit also reads any batch that starts with a name that is not a T-SQL statement
   word, such as `dbo.drop_stale_indexes;` or `sp_helpindex 'gis.t';` after a `GO` line, as such a
-  call. It reports an `UNPROVEN` line and exits 1. A batch ends at a line that holds only `GO`,
+  call. The name may start with any letter, a non-ASCII one too, or with `#`. It reports an `UNPROVEN` line and exits 1. A batch ends at a line that holds only `GO`,
   with an optional count. A label, such as `done:`, starts a batch with a name too, so it exits 1.
   Before this rule, the script `DROP INDEX ... ;`, `GO`, `dbo.drop_stale_indexes;` exited 0. [sp_prepare](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-prepare-transact-sql)
   prepares a statement for a later `sp_execute`, and
@@ -460,8 +471,8 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
 - Dynamic SQL is not run or expanded. Only `DROP INDEX` text that appears whole in the script is
   read. A removal built by joining string pieces inside `EXEC` is not read, and neither is one
   written as split tokens, such as `'DROP ' + 'INDEX'`. The `EXEC` itself is reported as
-  `UNPROVEN`, so the audit exits 1. A `DROP INDEX` written whole inside `EXEC('...')` is read as a
-  statement, and the `EXEC` line is reported too.
+  `UNPROVEN`, so the audit exits 1. A `DROP INDEX` written whole inside `EXEC('...')` is not
+  read either, because the tool blanks every string. The `EXEC` line is reported.
 - The version numbers of sp_IndexCleanup (2.11, dated 2026-11-01, read on 2026-11-11) and
   sp_BlitzIndex (8.34, read on 2026-10-12) are those I read. Later releases may differ.
 - Microsoft documents `VIEW SERVER PERFORMANCE STATE` for both `sys.dm_os_sys_info` and
@@ -476,9 +487,15 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   `--apply` writes holds only `SAFE` units, so it stays safe. The wording is the defect.
 - A closed output pipe during `--self-test`, such as `python sdeindex.py --self-test | head -1`,
   exits 2 with `error: ...`, as it does for a plan or an audit.
-- A `DROP INDEX`, `ALTER INDEX ... DISABLE` or `DROP CONSTRAINT` phrase inside a string, such as
-  `PRINT 'DROP INDEX x ON t'`, is read as a statement. The audit can print a false `REFUSED` or
-  `UNPROVEN`, and `--apply` can write a drop the author did not list.
+- A script whose only removals sit inside strings, such as `EXEC('DROP INDEX x ON gis.t')`, is
+  refused with exit 3 as holding no removal. When it also holds a real removal, the `EXEC` gets an
+  `UNPROVEN` line, and the removal inside the string is not judged.
+- A schema, table or index name in the index export that holds a control character or a Unicode
+  line break is refused with exit 3, because `SSMS` and `sqlcmd` would read a line of only `GO`
+  inside it as a batch separator. Rename the object, then export again. A line break at either end
+  of a name is trimmed, not refused.
+- A procedure called without `EXEC` after a semicolon at the start of a batch, such as
+  `;dbo.cleanup;`, is not read as a call. I did not verify whether SQL Server accepts that form.
 - A four-part table name (server.db.schema.table) is refused with exit 3, as a table name with a
   database part. In `ALTER TABLE srv.db.gis.t DROP uq_x` it is refused as unreadable, also with
   exit 3. Remove the server and database parts.
@@ -516,10 +533,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   copy exists, which base copy is the twin follows name order. Listing the other base copy can be
   refused as leaving its twin behind even though the drop is safe. The error is on the safe side.
 - The script `--apply` writes always uses `DROP INDEX`, which cannot be undone. Script the
-  `CREATE INDEX` statements first if you may want an index back. A line break in an index or table
-  name is written out as `\n` in the `--` comment lines. In the `DROP INDEX` line it stays inside
-  the brackets, as T-SQL allows, and SSMS and `sqlcmd` read a line of only `GO` inside it as a
-  batch separator, so what follows that line runs. Read the script before you run it.
+  `CREATE INDEX` statements first if you may want an index back. Read the script before you run it.
 - The script names no database, and the export carries no database name, so the script drops from
   whichever database the connection uses. Run it in the database you exported from. A second
   database with the same schema, table and index names, such as a test copy, would lose those
@@ -595,14 +609,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   backward compatibility, are refused with exit 3 as unreadable. Write `DROP INDEX index ON
   schema.table`.
 - The claim that SSMS and `sqlcmd` read a line of only `GO` inside a bracketed name as a batch
-  separator rests on how those clients split batches. Microsoft's [GO page](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/sql-server-utilities-statements-go)
+  separator, which is why a name with a line break is refused, rests on how those clients split batches. Microsoft's [GO page](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/sql-server-utilities-statements-go)
   says that `GO` is a command of those utilities and that a statement cannot share its line. It does
   not say what the utilities do inside a bracketed name. I did not run it, because no SQL Server
   client was available.
-- A name that holds a line break and a line of only `GO` is written inside the brackets of the
-  `DROP INDEX` line of the script. A person who can create indexes on a table can plant such a
-  name, and the text after the `GO` line then runs as separate batches. Read the script before
-  you run it, or remove such names from the export.
 - The `--print-query` T-SQL and the registry column names were never run against SQL Server.
 - Two filters that differ only in white space inside a string literal, such as `'Park  Ground'`
   and `'Park Ground'`, are read as identical, because the tool collapses white space in a filter.
@@ -621,14 +631,14 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   the unique index stays, but the word identical is looser than the test.
 - A script saved from SSMS with Script Index as DROP starts with `USE`, so it exits 3 until you
   delete that line.
-- The audit reads plain T-SQL only. A SQLCMD directive such as `:r other.sql`, `:connect` or `!!`
-  is ignored, so a removal in an included file is not seen and the audit can exit 0. Audit a
-  script that has none of them.
+- The audit reads plain T-SQL only. A line that starts with a SQLCMD command or `!!` is refused,
+  and the check reads the raw text, so a line inside a block comment or a multi-line string that
+  starts with `:r` is refused too. A SQLCMD command that does not start a line is not seen.
 - A call that has no `EXEC` can only be the first statement of a batch, and the audit marks that
   form. Any other procedure that removes indexes is marked only when `EXEC` or `EXECUTE` calls it.
   A removal in the argument of `sp_MSforeachtable`, or a call of `xp_cmdshell`, inside a batch is
-  marked by its `EXEC`. A removal that runs through a linked server, a job or a SQLCMD
-  directive is not seen, and the audit can exit 0.
+  marked by its `EXEC`. A removal that runs through a linked server or a job is not seen,
+  and the audit can exit 0.
 - A word in the batch-start list that is also the name of a procedure, such as a procedure named
   `Set` called without `EXEC`, is read as a statement word and not marked. The list holds the
   T-SQL statement words I know. A new statement word that it lacks exits 1, which errs on the

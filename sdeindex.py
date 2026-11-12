@@ -280,6 +280,12 @@ def index_from_row(row, line):
     """One export row as an Index. Raises Refused on a value it cannot read."""
     try:
         ragged(row)
+        for column in ("schema_name", "table_name", "index_name"):
+            if _CONTROL.search(row[column].strip()):
+                raise Refused("%s holds a control character or a line break. "
+                              "A name like that could plant a batch in the "
+                              "script. Rename the object, then export again"
+                              % column)
         return Index(
             row["schema_name"].strip(), row["table_name"].strip(),
             row["index_name"].strip(), row["type_desc"],
@@ -654,9 +660,11 @@ _DYNAMIC_QUOTED = re.compile(
     re.I)
 # A batch is cut at a line that holds only GO. The first word of a batch that is
 # not one of these starts a call without EXEC. A quoted first name is a call too.
+# A name may start with any letter, not only an ASCII one, or with # for a
+# temporary procedure.
 _GO = re.compile(r"(?:\A|(?<=[\r\n]))[ \t]*GO(?:[ \t]+\d+)?[ \t]*(?=[\r\n]|\Z)",
                  re.I)
-_FIRST = re.compile(r"\s*([A-Za-z_][\w@#$]*|[\[\"])")
+_FIRST = re.compile(r"\s*([^\W\d][\w@#$]*|#[\w@#$]*|[\[\"])")
 _STATEMENTS = frozenset("""
     ADD ALTER BACKUP BEGIN BREAK BULK CHECKPOINT CLOSE COMMIT CONTINUE CREATE
     DBCC DEALLOCATE DECLARE DELETE DENY DISABLE DROP ENABLE END EXEC EXECUTE
@@ -664,9 +672,16 @@ _STATEMENTS = frozenset("""
     READTEXT RECEIVE RECONFIGURE RESTORE RETURN REVERT REVOKE ROLLBACK SAVE
     SELECT SEND SET SETUSER SHUTDOWN THROW TRUNCATE UPDATE UPDATETEXT USE
     WAITFOR WHILE WITH WRITETEXT""".split())
-_STRING = re.compile(r"'(?:[^']|'')*'")
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\"(?:[^\"]|\"\")*\"")
 _BREAKS = re.compile(r"[;\r\n]")
+# A line that opens with a SQLCMD command (:r, :connect, :setvar ...) or with !!
+# is run by sqlcmd, not by the server, and may pull in a file this tool never
+# sees.
+_SQLCMD = re.compile(r"^[ \t]*(?::[A-Za-z]|!!)", re.M)
+# A control character or Unicode line break in a name. SSMS and sqlcmd split a
+# batch at a line of only GO even inside brackets, so such a name could plant a
+# batch in the script --apply writes.
+_CONTROL = re.compile("[\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]")
 
 
 def unquote(name):
@@ -680,6 +695,13 @@ def unquote(name):
 def blank(text):
     """The text with every character but a line break turned into a space."""
     return re.sub(r"[^\r\n]", " ", text)
+
+
+def blank_strings(text):
+    """The text with each string literal blanked and each bracketed or quoted
+    name kept. An apostrophe inside [bob's idx] opens no string."""
+    return _QUOTED.sub(
+        lambda m: blank(m.group()) if m.group()[0] == "'" else m.group(), text)
 
 
 def strip_comments(text):
@@ -756,7 +778,14 @@ def parse_drops(text):
     sp_IndexCleanup scripts, and ALTER TABLE ... DROP [CONSTRAINT], which it
     scripts for a unique constraint. Microsoft makes the keyword optional. Other ALTER INDEX statements are not
     removals. DROP TABLE removes every index on the table, so it is refused."""
-    clean = strip_comments(text)
+    sqlcmd = _SQLCMD.search(text)
+    if sqlcmd:
+        raise Refused("line %d: a SQLCMD command (:r, :connect, !! ...) runs "
+                      "outside the server and may read a file this tool "
+                      "never sees. Take it out, then audit the script it "
+                      "includes on its own."
+                      % (text.count("\n", 0, sqlcmd.start()) + 1))
+    clean = blank_strings(strip_comments(text))
     masked = mask_quoted(clean)
     use = _USE.search(_QUOTED.sub(lambda m: blank(m.group()), clean))
     if use:
@@ -831,7 +860,7 @@ def dynamic_lines(text):
     sp_prepexec appears outside a string, a quoted name and a comment."""
     bare = strip_comments(text)
     clean = _QUOTED.sub(lambda m: blank(m.group()), bare)
-    quoted = _STRING.sub(lambda m: blank(m.group()), bare)
+    quoted = blank_strings(bare)
     return sorted(set(clean.count("\n", 0, m.start()) + 1
                       for m in _DYNAMIC.finditer(clean)) |
                   set(quoted.count("\n", 0, m.start()) + 1
@@ -844,7 +873,7 @@ def bare_call_lines(text):
     batch, so `dbo.cleanup;` after a GO line is a procedure call, and its text is
     unread. A GO line is the word GO alone on its line, with an optional count."""
     bare = strip_comments(text)
-    quoted = _STRING.sub(lambda m: blank(m.group()), bare)
+    quoted = blank_strings(bare)
     out = []
     for start in [0] + [m.end() for m in _GO.finditer(quoted)]:
         m = _FIRST.match(quoted, start)
@@ -1302,6 +1331,14 @@ def self_test():
            "the header is refused", "more fields")
     raises(lambda: index_from_row(dict(good, is_unique="x"), 8),
            "a bad flag names its line", "line 8")
+    for column in ("schema_name", "table_name", "index_name"):
+        for bad in ("a\nGO\nSELECT 1", "a\rb", "a\x00b", "a\u2028b"):
+            raises(lambda: index_from_row(dict(good, **{column: bad}), 9),
+                   "a %s with %r is refused, so no script can hold a planted "
+                   "batch  <-- pinned defect" % (column, bad),
+                   "%s holds a control character" % column)
+    check(index_from_row(dict(good, index_name="  ix_a \n"), 10).name ==
+          "ix_a", "a line break around a name is trimmed, not refused")
 
     # ---- uptime and registry
     rows = [{UPTIME_COLUMN: "720"}, {UPTIME_COLUMN: "720"}]
@@ -1879,6 +1916,29 @@ def self_test():
           "uq_x",
           "a constraint drop with no CONSTRAINT keyword is read as a removal  "
           "<-- pinned defect")
+    for directive in (":r hidden.sql", "  :connect other", "!! del x",
+                      "\t:setvar a b", ":ON ERROR ignore"):
+        raises(lambda: parse_drops("DROP INDEX a ON gis.t;\n" + directive),
+               "a SQLCMD line %r is refused, so an included file cannot hide "
+               "a removal  <-- pinned defect" % directive,
+               "line 2: a SQLCMD command")
+    check(parse_drops("PRINT ':r x';\nSELECT a::b, 1 -- :r\n"
+                      "DROP INDEX a ON gis.t;\n: 1\n!x")[0][2] == "a",
+          "a colon or bang inside a line, or a colon before a space, is not "
+          "SQLCMD")
+    check(parse_drops("PRINT 'DROP INDEX x ON t';\nPRINT 'a\nDROP INDEX y ON "
+                      "t\nb';\nDROP INDEX a ON gis.t;") ==
+          [("gis", "t", "a", 5)],
+          "a DROP INDEX phrase inside a string, one that spans lines too, is "
+          "text, not a removal  <-- pinned defect")
+    raises(lambda: parse_drops("PRINT 'DROP INDEX x ON gis.t';\nSELECT 1;"),
+           "a script whose only removal is inside a string holds none",
+           "holds no DROP INDEX")
+    check(parse_drops("PRINT 'DROP TABLE t; CREATE INDEX a ON t (c) WITH "
+                      "(DROP_EXISTING = ON)';\nDROP INDEX [it's] ON gis.t;"
+                      )[0][2] == "it's",
+          "DROP TABLE and DROP_EXISTING inside a string do not refuse the "
+          "script, and a quoted name keeps its apostrophe")
     raises(lambda: parse_drops("ALTER TABLE gis.t DROP uq_x, uq_y;"),
            "a keyword-less drop naming two constraints is refused",
            "several indexes")
@@ -2178,6 +2238,18 @@ def self_test():
     check(bare_call_lines("GO\n;x\nGO 2\r\nGO\n  go  \ndbo.p;\nGO\n") == [6],
           "GO lines of any case or count cut batches, and an empty batch or "
           "one that starts with a semicolon holds no call")
+    check(bare_call_lines("GO\n\u00e9xec_p;\nGO\n#tmp;\nGO\n\u00e9") == [2, 4, 6],
+          "a batch that starts with a non-ASCII letter or # is a call too  "
+          "<-- pinned defect")
+    check(bare_call_lines("DROP INDEX [bob's idx] ON gis.t;\nGO\ndbo.cleanup;\n"
+                          "PRINT 'x';") == [3] and
+          dynamic_lines("DROP INDEX [bob's idx] ON gis.t;\nEXEC p;\n"
+                        "PRINT 'x';") == [2],
+          "an apostrophe inside a bracketed name opens no string, so a later "
+          "GO line and call are still seen  <-- pinned defect")
+    check(bare_call_lines("PRINT 'a'; DROP INDEX \"it's\" ON gis.t;\nGO\n"
+                          "dbo.p;\nPRINT 'it''s';") == [3],
+          "a double-quoted name with an apostrophe opens no string either")
     check(bare_call_lines("PRINT 'x\nGO\ndbo.a'\n/*\nGO\n*/\nDECLARE @n int;\n"
                           "GO now\nSET NOCOUNT ON;\nGO\nIF 1 = 1 EXEC p;\n"
                           "GO\nWITH c AS (SELECT 1) SELECT 1;\nGO\nEXEC dbo.p;"
