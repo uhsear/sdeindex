@@ -444,9 +444,10 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   The name in a constraint drop is looked up among the indexes of that table. When it matches an
   index that has no primary key or unique constraint behind it, the verdict is `UNPROVEN` and the
   run exits 1, because the statement drops a constraint and the export lists no constraint names.
-  A foreign key, check or default constraint that shares its name with a unique-constraint index
-  or primary key on the same table is still judged as that index, and the tool cannot tell the
-  two apart. Do not give a constraint the name of an index on its table.
+  A foreign key, check or default constraint cannot share its name with a primary key or unique
+  constraint, because SQL Server keeps constraint names unique within a schema. It can share the
+  name of a plain index on the table, which is the `UNPROVEN` case above. Do not give a constraint
+  the name of an index on its table.
 - `CREATE SPATIAL INDEX`, `CREATE XML INDEX` and `CREATE NONCLUSTERED HASH INDEX` with
   `DROP_EXISTING = ON` are skipped, not refused. Only `CREATE INDEX` is refused. No nonclustered
   index that the tool judges can be rewritten by those forms, so no verdict changes.
@@ -559,7 +560,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   ahead for its end. Timings were taken on one machine and vary by more than a factor of two; treat them as an order of
   magnitude. The 100000-statement figure of about 200 seconds is an extrapolation from the shorter
   runs, not a measured run. A later run on Windows with Python 3.13.2 took about 1.8 s for the 20000-statement
-  script and 9.6 s on another run.
+  script and 9.6 s on another run. Timings are not part of the self-test.
 - Save the export from the grid, not from Results to Text. SSMS cuts a column at 256 characters
   there by default, and a column list cut short can make two different indexes look identical. The
   tool cannot detect the cut.
@@ -634,7 +635,7 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   removes.
 - It opens no socket, imports no network module and reads no password or token. The normal plan
   and audit paths read no environment variable. Only `--self-test` touches the environment: it
-  copies it into one of its two child Python processes, which prints none of it. The self-test reads its
+  passes it to its two child Python processes, which print none of it. The self-test reads its
   own source and checks the imports. A refusal quotes the value
   it refused, so read a refusal before you paste it into a ticket.
 - `ALTER TABLE t DROP INDEX ix`, the form Microsoft documents for memory-optimized tables, is
@@ -700,6 +701,18 @@ not pass it. A person reads each `UNPROVEN` line and decides. The script `--appl
   broken tool from a refused list. Read the last line of the output.
 - On Linux, a Windows path passed to `--drops`, such as `C:\dir\file.sql`, is copied whole into the
   first comment line of the script, because `os.path.basename` splits only on `/` there.
+- A table or index name that contains a statement phrase, such as `CREATE INDEX`, can hide an
+  `ALTER INDEX ... DISABLE` from the audit. The statement is skipped without a message, and the run
+  can exit 0.
+- `ALTER TABLE ... ADD CONSTRAINT ... WITH (DROP_EXISTING = ON)` rewrites an index, as the
+  `CREATE INDEX` form does. The audit skips it and does not refuse it. I did not verify whether
+  SQL Server accepts that form. Keep such a statement out of a script that you audit.
+- The tool reads `"..."` as a quoted name, as SSMS does with `QUOTED_IDENTIFIER ON`. `sqlcmd` reads
+  it as a string unless you pass `-I`.
+- A line of only `GO` inside a string literal is not counted as a batch separator, although SSMS
+  and `sqlcmd` split the batch there. A bare procedure call after that line is not marked.
+- A removal sent through `OPENQUERY` or `OPENROWSET` sits in a string that the tool does not read,
+  and the audit can exit 0.
 
 ## Contributing
 
